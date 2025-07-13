@@ -22,9 +22,9 @@ type Map struct {
 	// 节点到虚拟节点数量的映射
 	nodeReplicas map[string]int
 	// 节点负载统计
-	nodeCounts map[string]int64
+	nodeCounts map[string]*atomic.Int64
 	// 总请求数
-	totalRequests int64
+	totalRequests atomic.Int64
 }
 
 // New 创建一致性哈希实例
@@ -33,7 +33,7 @@ func New(opts ...Option) *Map {
 		config:       DefaultConfig,
 		hashMap:      make(map[int]string),
 		nodeReplicas: make(map[string]int),
-		nodeCounts:   make(map[string]int64),
+		nodeCounts:   make(map[string]*atomic.Int64),
 	}
 
 	for _, opt := range opts {
@@ -133,9 +133,8 @@ func (m *Map) Get(key string) string {
 	}
 
 	node := m.hashMap[m.keys[idx]]
-	count := m.nodeCounts[node]
-	m.nodeCounts[node] = count + 1
-	atomic.AddInt64(&m.totalRequests, 1)
+	m.nodeCounts[node].Add(1)
+	m.totalRequests.Add(1)
 
 	return node
 }
@@ -152,16 +151,19 @@ func (m *Map) addNode(node string, replicas int) {
 
 // checkAndRebalance 检查并重新平衡虚拟节点
 func (m *Map) checkAndRebalance() {
-	if atomic.LoadInt64(&m.totalRequests) < 1000 {
+	if m.totalRequests.Load() < 1000 {
 		return // 样本太少，不进行调整
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	// 计算负载情况
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
+	avgLoad := float64(m.totalRequests.Load()) / float64(len(m.nodeReplicas))
 	var maxDiff float64
 
-	for _, count := range m.nodeCounts {
-		diff := math.Abs(float64(count) - avgLoad)
+	for _, counter := range m.nodeCounts {
+		count := float64(counter.Load())
+		diff := math.Abs(count - avgLoad)
 		if diff/avgLoad > maxDiff {
 			maxDiff = diff / avgLoad
 		}
@@ -169,7 +171,7 @@ func (m *Map) checkAndRebalance() {
 
 	// 如果负载不均衡度超过阈值，调整虚拟节点
 	if maxDiff > m.config.LoadBalanceThreshold {
-		m.rebalanceNodes()
+		go m.rebalanceNodes() //// 异步重平衡，避免阻塞 Get
 	}
 }
 
@@ -178,12 +180,13 @@ func (m *Map) rebalanceNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	avgLoad := float64(m.totalRequests) / float64(len(m.nodeReplicas))
+	avgLoad := float64(m.totalRequests.Load()) / float64(len(m.nodeReplicas))
 
 	// 调整每个节点的虚拟节点数量
-	for node, count := range m.nodeCounts {
+	for node, counter := range m.nodeCounts {
 		currentReplicas := m.nodeReplicas[node]
-		loadRatio := float64(count) / avgLoad
+		count := float64(counter.Load())
+		loadRatio := count / avgLoad
 
 		var newReplicas int
 		if loadRatio > 1 {
@@ -212,10 +215,10 @@ func (m *Map) rebalanceNodes() {
 	}
 
 	// 重置计数器
-	for node := range m.nodeCounts {
-		m.nodeCounts[node] = 0
+	for _, counter := range m.nodeCounts {
+		counter.Store(0)
 	}
-	atomic.StoreInt64(&m.totalRequests, 0)
+	m.totalRequests.Store(0)
 
 	// 重新排序
 	sort.Ints(m.keys)
@@ -227,13 +230,14 @@ func (m *Map) GetStats() map[string]float64 {
 	defer m.mu.RUnlock()
 
 	stats := make(map[string]float64)
-	total := atomic.LoadInt64(&m.totalRequests)
+	total := m.totalRequests.Load()
 	if total == 0 {
 		return stats
 	}
 
-	for node, count := range m.nodeCounts {
-		stats[node] = float64(count) / float64(total)
+	for node, counter := range m.nodeCounts {
+		count := float64(counter.Load())
+		stats[node] = count / float64(total)
 	}
 	return stats
 }
