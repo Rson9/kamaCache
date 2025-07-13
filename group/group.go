@@ -151,7 +151,7 @@ func (g *Group) Get(ctx context.Context, key string) (cache.ByteView, bool) {
 	}
 
 	// 优先查本地缓存
-	view, ok := g.mainCache.Get(ctx, key)
+	view, ok := g.mainCache.Get(key)
 	if ok {
 		atomic.AddInt64(&g.stats.localHits, 1)
 		return view, true
@@ -305,6 +305,12 @@ func (g *Group) Close() error {
 
 // load 从其他节点加载数据
 func (g *Group) load(ctx context.Context, key string) (cache.ByteView, bool) {
+	// 判断peers是否为空
+	if g.peers == nil {
+		logrus.Debug("[group.go] function:load 单节点模式，无远程节点，跳过加载")
+		return cache.ByteView{}, false
+	}
+
 	// 选择一个节点加载
 	peer, err := g.peers.PickPeer(key)
 	if err != nil {
