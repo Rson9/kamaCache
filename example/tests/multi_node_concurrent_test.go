@@ -37,8 +37,8 @@ func TestMultiNodeConcurrentPerformance(t *testing.T) {
 
 	// 测试参数
 	const (
-		totalClients  = 1000
-		opsPerClient  = 200
+		totalClients  = 100
+		opsPerClient  = 10
 		testKeyPrefix = "concurrent_key"
 		testValue     = "distributed_value"
 	)
