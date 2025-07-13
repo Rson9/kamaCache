@@ -1,0 +1,10 @@
+version: v1
+plugins:
+  - plugin: buf.build/protocolbuffers/go
+    out: ./gen
+    # 这个 module 参数其实就是协议 package 的第一个点的名称，去掉的话就会多一层名为 bufexample 的目录
+    opt: paths=source_relative
+  - plugin: buf.build/grpc/go:v1.3.0
+    out: ./gen
+    # 这个 module 参数其实就是协议 package 的第一个点的名称，去掉的话就会多一层名为 bufexample 的目录
+    opt: paths=source_relative
