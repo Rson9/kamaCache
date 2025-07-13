@@ -248,7 +248,7 @@ func (s *Server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, 
 		return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
 	}
 	ctx = utils.WithOrigin(ctx, utils.OriginPeer)
-	// 根据找到的group,通过key去获取数据，同时必须传入ctx，因为其中包含了是其他节点的请求
+	// 根据找到的group,通过key去获取数据
 	view, ok := group.Get(ctx, req.Key)
 	// 如果没找到，返回错误
 	if !ok {
@@ -261,7 +261,6 @@ func (s *Server) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, 
 
 // Set 实现 Cache 服务的 Set 方法
 func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
-	ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	// 判断传入的请求group是否存在
 	group, ok := s.groups.Load(req.Group)
 	// 如果不存在，返回错误
@@ -269,6 +268,7 @@ func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, 
 		return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
 	}
 
+		ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	// 根据找到的group,通过key去设置数据，同时必须传入ctx，因为其中包含了是其他节点的请求
 	if err := group.Set(ctx, req.Key, req.Value); err != nil {
 		logrus.Errorf("Error setting key '%s' in group '%s': %v", req.Key, req.Group, err)
@@ -280,12 +280,11 @@ func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, 
 
 // Delete 实现 Cache 服务的 Delete 方法
 func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	group, ok := s.groups.Load(req.Group)
 	if !ok || group == nil {
 		return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
 	}
-
+		ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	if err := group.Delete(ctx, req.Key); err != nil {
 		logrus.Errorf("Error deleting key '%s' from group '%s': %v", req.Key, req.Group, err)
 		return nil, status.Errorf(codes.Internal, "failed to delete key '%s': %v", req.Key, err)

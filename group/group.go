@@ -209,7 +209,7 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 
 	// 只有本地调用才会向其他节点同步，避免来自 Peer 的请求再次触发同步
 	if !utils.IsFromPeer(ctx) {
-		g.startPeerSync(context.Background(), "delete", key, nil)
+		g.startPeerSync(ctx, "delete", key, nil)
 	}
 
 	return nil
@@ -254,7 +254,7 @@ func (g *Group) syncToPeers(ctx context.Context, op, key string, value []byte) {
 	case "set":
 		ok = peer.Set(ctx, g.name, key, value)
 	case "delete":
-		ok = peer.Delete(context.Background(), g.name, key)
+		ok = peer.Delete(ctx, g.name, key)
 	default:
 		logrus.Warnf("[KamaCache] group '%s': unknown sync operation '%s' for key '%s'", g.name, op, key)
 		return
