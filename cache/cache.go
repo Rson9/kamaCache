@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,7 +102,7 @@ func (c *Cache) Add(key string, value ByteView) {
 }
 
 // Get 从缓存中获取值
-func (c *Cache) Get(ctx context.Context, key string) (value ByteView, ok bool) {
+func (c *Cache) Get(key string) (value ByteView, ok bool) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return ByteView{}, false
 	}

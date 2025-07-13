@@ -1,4 +1,4 @@
-package main
+package tests
 
 import (
 	"context"
@@ -19,10 +19,10 @@ func TestGRPCConnectivity(t *testing.T) {
 	defer cancel()
 
 	// 这里调用 Get 尝试通信，但不要求一定命中缓存
-	_, ok := cli.Get(ctx, "my_cache_group", "test-key")
+	val, ok := cli.Get(ctx, "my_cache_group", "test-key")
 	if !ok {
 		t.Log("key missing")
 	} else {
-		t.Log("Get succeeded")
+		t.Log("Get succeeded: value=", string(val))
 	}
 }
