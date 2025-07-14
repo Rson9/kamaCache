@@ -4,8 +4,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 type lru2Store struct {
@@ -352,11 +350,6 @@ func (s *lru2Store) delete(key string, idx int32) bool {
 		} else if n2 != nil && n2.v != nil {
 			s.onEvicted(key, n2.v)
 		}
-	}
-
-	if deleted {
-		zap.L().Info("删除缓存")
-		// s.expirations.Delete(key)
 	}
 
 	return deleted
