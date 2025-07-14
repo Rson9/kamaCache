@@ -1,6 +1,7 @@
 package store
 
 import (
+	"container/heap"
 	"container/list"
 	"sync"
 	"time"
@@ -8,13 +9,17 @@ import (
 
 // lruCache 是基于标准库 list 的 LRU 缓存实现
 type lruCache struct {
-	mu              sync.RWMutex
-	list            *list.List               // 双向链表，用于维护 LRU 顺序
-	items           map[string]*list.Element // 键到链表节点的映射
-	expires         map[string]time.Time     // 过期时间映射
-	maxBytes        int64                    // 最大允许字节数
-	usedBytes       int64                    // 当前使用的字节数
-	onEvicted       func(key string, value Value)
+	mu    sync.Mutex
+	list  *list.List               // 双向链表，用于维护 LRU 顺序
+	items map[string]*list.Element // 键到链表节点的映射
+	//expires         map[string]time.Time     // 过期时间映射(-1 表示无过期时间)
+	maxBytes  int64 // 最大允许字节数
+	usedBytes int64 // 当前使用的字节数
+	onEvicted func(key string, value Value)
+	// 用于高效过期处理的结构
+	expireHeap expirationHeap // 最小堆，按过期时间排序
+	heapIndex  map[string]int // 键到堆内索引的映射
+
 	cleanupInterval time.Duration
 	cleanupTicker   *time.Ticker
 	closeCh         chan struct{} // 用于优雅关闭清理协程
@@ -35,14 +40,18 @@ func newLRUCache(opts Options) *lruCache {
 	}
 
 	c := &lruCache{
-		list:            list.New(),
-		items:           make(map[string]*list.Element),
-		expires:         make(map[string]time.Time),
+		list:  list.New(),
+		items: make(map[string]*list.Element),
+		//expires:         make(map[string]time.Time),
 		maxBytes:        opts.MaxBytes,
 		onEvicted:       opts.OnEvicted,
+		expireHeap:      make(expirationHeap, 0),
+		heapIndex:       make(map[string]int),
 		cleanupInterval: cleanupInterval,
 		closeCh:         make(chan struct{}),
 	}
+
+	heap.Init(&c.expireHeap)
 
 	// 启动定期清理协程
 	c.cleanupTicker = time.NewTicker(c.cleanupInterval)
@@ -53,42 +62,30 @@ func newLRUCache(opts Options) *lruCache {
 
 // Get 获取缓存项，如果存在且未过期则返回
 func (c *lruCache) Get(key string) (Value, bool) {
-	c.mu.RLock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	elem, ok := c.items[key]
 	if !ok {
-		c.mu.RUnlock()
 		return nil, false
 	}
 
 	// 检查是否过期
-	if expTime, hasExp := c.expires[key]; hasExp && time.Now().After(expTime) {
-		c.mu.RUnlock()
-
-		// 异步删除过期项，避免在读锁内操作
-		go c.Delete(key)
-
-		return nil, false
+	if idx, hasExp := c.heapIndex[key]; hasExp {
+		if c.expireHeap[idx].expiresAt.Before(time.Now()) {
+			// 同步删除过期项
+			c.removeElement(elem)
+			return nil, false
+		}
 	}
 
-	// 获取值并释放读锁
-	entry := elem.Value.(*lruEntry)
-	value := entry.value
-	c.mu.RUnlock()
-
-	// 更新 LRU 位置需要写锁
-	c.mu.Lock()
-	// 再次检查元素是否仍然存在（可能在获取写锁期间被其他协程删除）
-	if _, ok := c.items[key]; ok {
-		c.list.MoveToBack(elem)
-	}
-	c.mu.Unlock()
-
-	return value, true
+	// 命中，移动到队尾
+	c.list.MoveToBack(elem)
+	return elem.Value.(*lruEntry).value, true
 }
 
 // Set 添加或更新缓存项
 func (c *lruCache) Set(key string, value Value) error {
-	return c.SetWithExpiration(key, value, 0)
+	return c.SetWithExpiration(key, value, -1)
 }
 
 // SetWithExpiration 添加或更新缓存项，并设置过期时间
@@ -101,32 +98,24 @@ func (c *lruCache) SetWithExpiration(key string, value Value, expiration time.Du
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 计算过期时间
-	var expTime time.Time
-	if expiration > 0 {
-		expTime = time.Now().Add(expiration)
-		c.expires[key] = expTime
-	} else {
-		delete(c.expires, key)
-	}
-
 	// 如果键已存在，更新值
 	if elem, ok := c.items[key]; ok {
+		c.list.MoveToBack(elem)
 		oldEntry := elem.Value.(*lruEntry)
 		c.usedBytes += int64(value.Len() - oldEntry.value.Len())
 		oldEntry.value = value
-		c.list.MoveToBack(elem)
-		return nil
+	} else {
+		// 添加新项
+		entry := &lruEntry{key: key, value: value}
+		elem := c.list.PushBack(entry)
+		c.items[key] = elem
+		c.usedBytes += int64(len(key) + value.Len())
 	}
-
-	// 添加新项
-	entry := &lruEntry{key: key, value: value}
-	elem := c.list.PushBack(entry)
-	c.items[key] = elem
-	c.usedBytes += int64(len(key) + value.Len())
+	// 更新过期时间
+	c.updateExpiration(key, expiration)
 
 	// 检查是否需要淘汰旧项
-	c.evict()
+	c.evict(true)
 
 	return nil
 }
@@ -146,60 +135,96 @@ func (c *lruCache) Delete(key string) bool {
 // Clear 清空缓存
 func (c *lruCache) Clear() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// 如果设置了回调函数，遍历所有项调用回调
+	// 暂存需要回调的条目
+	var entriesToEvict []*lruEntry
 	if c.onEvicted != nil {
+		entriesToEvict = make([]*lruEntry, 0, c.list.Len())
 		for _, elem := range c.items {
-			entry := elem.Value.(*lruEntry)
-			c.onEvicted(entry.key, entry.value)
+			entriesToEvict = append(entriesToEvict, elem.Value.(*lruEntry))
 		}
 	}
 
 	c.list.Init()
 	c.items = make(map[string]*list.Element)
-	c.expires = make(map[string]time.Time)
+	c.expireHeap = make(expirationHeap, 0)
+	c.heapIndex = make(map[string]int)
 	c.usedBytes = 0
+	c.mu.Unlock()
+	// 在锁外执行回调
+	if c.onEvicted != nil {
+		for _, entry := range entriesToEvict {
+			c.onEvicted(entry.key, entry.value)
+		}
+	}
 }
 
 // Len 返回缓存中的项数
 func (c *lruCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.list.Len()
 }
 
 // removeElement 从缓存中删除元素，调用此方法前必须持有锁
-func (c *lruCache) removeElement(elem *list.Element) {
-	entry := elem.Value.(*lruEntry)
-	c.list.Remove(elem)
-	delete(c.items, entry.key)
-	delete(c.expires, entry.key)
-	c.usedBytes -= int64(len(entry.key) + entry.value.Len())
-
-	if c.onEvicted != nil {
-		c.onEvicted(entry.key, entry.value)
+// 它不执行回调，而是返回待处理的条目。
+func (c *lruCache) removeElement(elem *list.Element) *lruEntry {
+	if elem == nil {
+		return nil
 	}
+	entry := c.list.Remove(elem).(*lruEntry)
+	delete(c.items, entry.key)
+	c.usedBytes -= int64(len(entry.key) + entry.value.Len())
+	// 从过期堆中移除
+	if idx, ok := c.heapIndex[entry.key]; ok {
+		heap.Remove(&c.expireHeap, idx)
+		delete(c.heapIndex, entry.key)
+	}
+
+	return entry
 }
 
 // evict 清理过期和超出内存限制的缓存，调用此方法前必须持有锁
-func (c *lruCache) evict() {
-	// 先清理过期项
+// atexit 表示是否需要在函数退出时执行回调
+func (c *lruCache) evict(atexit bool) {
+	var evictedEntries []*lruEntry
+
+	// 1. 高效清理过期项
 	now := time.Now()
-	for key, expTime := range c.expires {
-		if now.After(expTime) {
-			if elem, ok := c.items[key]; ok {
-				c.removeElement(elem)
+	for c.expireHeap.Len() > 0 && c.expireHeap[0].expiresAt.Before(now) {
+		item := heap.Pop(&c.expireHeap).(*expireItem)
+		delete(c.heapIndex, item.key)
+
+		if elem, ok := c.items[item.key]; ok {
+			entry := c.list.Remove(elem).(*lruEntry)
+			delete(c.items, entry.key)
+			c.usedBytes -= int64(len(entry.key) + entry.value.Len())
+			if atexit && c.onEvicted != nil {
+				evictedEntries = append(evictedEntries, entry)
 			}
 		}
 	}
 
-	// 再根据内存限制清理最久未使用的项
+	// 2. 根据内存限制清理最久未使用的项
 	for c.maxBytes > 0 && c.usedBytes > c.maxBytes && c.list.Len() > 0 {
-		elem := c.list.Front() // 获取最久未使用的项（链表头部）
+		elem := c.list.Front()
 		if elem != nil {
-			c.removeElement(elem)
+			entry := c.removeElement(elem)
+			if atexit && c.onEvicted != nil && entry != nil {
+				evictedEntries = append(evictedEntries, entry)
+			}
 		}
+	}
+
+	// 在持有锁的函数退出前不执行回调
+	if !atexit || c.onEvicted == nil || len(evictedEntries) == 0 {
+		return
+	}
+
+	// 如果需要，释放锁并执行回调
+	c.mu.Unlock()
+	defer c.mu.Lock() // re-lock defer
+	for _, entry := range evictedEntries {
+		c.onEvicted(entry.key, entry.value)
 	}
 }
 
@@ -209,7 +234,7 @@ func (c *lruCache) cleanupLoop() {
 		select {
 		case <-c.cleanupTicker.C:
 			c.mu.Lock()
-			c.evict()
+			c.evict(true)
 			c.mu.Unlock()
 		case <-c.closeCh:
 			return
@@ -225,73 +250,92 @@ func (c *lruCache) Close() {
 	}
 }
 
-// GetWithExpiration 获取缓存项及其剩余过期时间
+// GetWithExpiration 获取缓存项及其剩余过期时间。
+// 如果项存在且未过期，会更新其 LRU 位置。
+// 如果项已过期，会将其从缓存中移除。
 func (c *lruCache) GetWithExpiration(key string) (Value, time.Duration, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	elem, ok := c.items[key]
 	if !ok {
 		return nil, 0, false
 	}
 
-	// 检查是否过期
-	now := time.Now()
-	if expTime, hasExp := c.expires[key]; hasExp {
+	// 检查该项是否有过期时间设置
+	if idx, hasExp := c.heapIndex[key]; hasExp {
+		expTime := c.expireHeap[idx].expiresAt
+		now := time.Now()
+
 		if now.After(expTime) {
-			// 已过期
+			// 项已过期，立即将其移除
+			c.removeElement(elem)
 			return nil, 0, false
 		}
 
-		// 计算剩余过期时间
+		// 项未过期，计算剩余TTL，并更新LRU位置
 		ttl := expTime.Sub(now)
 		c.list.MoveToBack(elem)
 		return elem.Value.(*lruEntry).value, ttl, true
 	}
 
-	// 无过期时间
+	// 项存在，但没有设置过期时间
 	c.list.MoveToBack(elem)
 	return elem.Value.(*lruEntry).value, 0, true
 }
 
-// GetExpiration 获取键的过期时间
+// GetExpiration 获取键的过期时间。
+// 这是一个只读查询，不会改变缓存的LRU顺序。
 func (c *lruCache) GetExpiration(key string) (time.Time, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	expTime, ok := c.expires[key]
-	return expTime, ok
-}
-
-// UpdateExpiration 更新过期时间
-func (c *lruCache) UpdateExpiration(key string, expiration time.Duration) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, ok := c.items[key]; !ok {
-		return false
+	// 通过 heapIndex 查询是否存在过期设置
+	if idx, ok := c.heapIndex[key]; ok {
+		// 确保这个 key 确实存在于缓存中，防止极端情况下的不一致
+		if _, exists := c.items[key]; exists {
+			return c.expireHeap[idx].expiresAt, true
+		}
 	}
 
+	// 如果 key 不存在或没有设置过期时间，返回零值
+	return time.Time{}, false
+}
+
+// updateExpiration 内部方法，更新一个key的过期时间。调用前需持有锁。
+func (c *lruCache) updateExpiration(key string, expiration time.Duration) {
 	if expiration > 0 {
-		c.expires[key] = time.Now().Add(expiration)
+		expTime := time.Now().Add(expiration)
+		if idx, ok := c.heapIndex[key]; ok {
+			// 更新现有项
+			c.expireHeap[idx].expiresAt = expTime
+			heap.Fix(&c.expireHeap, idx)
+		} else {
+			// 添加新项
+			item := &expireItem{key: key, expiresAt: expTime}
+			heap.Push(&c.expireHeap, item)
+			c.heapIndex[key] = item.index
+		}
 	} else {
-		delete(c.expires, key)
+		// 移除过期时间
+		if idx, ok := c.heapIndex[key]; ok {
+			heap.Remove(&c.expireHeap, idx)
+			delete(c.heapIndex, key)
+		}
 	}
-
-	return true
 }
 
 // UsedBytes 返回当前使用的字节数
 func (c *lruCache) UsedBytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.usedBytes
 }
 
 // MaxBytes 返回最大允许字节数
 func (c *lruCache) MaxBytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.maxBytes
 }
 
@@ -302,6 +346,6 @@ func (c *lruCache) SetMaxBytes(maxBytes int64) {
 
 	c.maxBytes = maxBytes
 	if maxBytes > 0 {
-		c.evict()
+		c.evict(true)
 	}
 }
