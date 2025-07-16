@@ -23,17 +23,20 @@
 **调用流程图:**
 ```mermaid
 graph TD
-    A[💻 你的应用] -- Get("my_key") --> B{🗃️ Cache Group};
-    subgraph "KamaCache-Go 实例"
-        B -- 1. 查本地缓存 --> C[🗑️ LRU Cache];
-        C -- ✅ 命中 --> D[返回值];
-        C -- ❌ 未命中 --> E{2. 调用 Getter};
-        E -- 从数据源获取 --> F[🗄️ 数据库/API];
-        F -- 返回数据 --> E;
-        E -- 3. 填充缓存 --> C;
-        E -- 返回数据 --> D;
+    A[💻 你的应用] -->|Get(my_key)| B{🗃️ Cache Group}
+
+    subgraph KamaCache-Go实例
+        B -->|1. 查本地缓存| C[🗑️ LRU Cache]
+        C -->|✅ 命中| D[返回值]
+        C -->|❌ 未命中| E{2. 调用 Getter}
+        E -->|从数据源获取| F[🗄️ 数据库或API]
+        F --> E
+        E -->|3. 填充缓存| C
+        E --> D
     end
-    D --> A;
+
+    D --> A
+
 ```
 
 ### 2.2 🌐 分布式集群模式
