@@ -58,13 +58,13 @@ graph TD
 graph TD
     Client[💻 应用 @ 节点A] -- Get(key) --> GA{🗃️ Group @ 节点A}
   
-    subgraph "KamaCache-Go 库内部 (完全自动)"
-        GA -- 1. 优先查本地 --> CA[🗑️ LRU @ A]
+     subgraph "KamaCache-Go"
+        GA -- 优先查本地 --> CA[🗑️ LRU @ A]
         CA -- ✅ 本地命中 --> Client
-        CA -- ❌ 本地未命中 --> Pick{2. 内部查询<br>一致性哈希环}
-        Pick -- 负责人是自己 --> Load(3a. 内部调用 Getter<br>从 DB 加载)
+        CA -- ❌ 本地未命中 --> Pick{内部查询<br>一致性哈希环}
+        Pick -- 负责人是自己 --> Load(内部调用 Getter<br>从 DB 加载)
         Load -- 返回值 --> Client
-        Pick -- 负责人是节点B --> gRPCClient(3b. 内部发起<br>📞 gRPC 请求)
+        Pick -- 负责人是节点B --> gRPCClient(内部发起<br>📞 gRPC 请求)
     end
 
     subgraph 节点B
