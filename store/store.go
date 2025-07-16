@@ -42,6 +42,7 @@ type Options struct {
 	OnEvicted func(key string, value Value)
 	// OnLenChange 当缓存长度变化时的回调函数
 	OnLengthChange func(delta int)
+	Hash           HashFunc // 新增，可选的哈希算法，默认为 BKDR
 }
 
 func NewOptions() Options {
