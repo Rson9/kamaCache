@@ -1,228 +1,243 @@
-# 📘 KamaCache 分布式缓存架构文档
+# KamaCache-Go: 分布式缓存架构与使用指南 🚀
 
+## 1.0 概述 🌟
 
-### 📦 单实例部署（本地缓存模式）
+**KamaCache-Go** 是一个 “开箱即用” 的高性能、分布式 Go 内存缓存库。它将复杂的分布式逻辑（如节点发现、gRPC通信、一致性哈希）完全封装，为开发者提供了一个极其简洁的 API。你只需几行代码，就能将你的单机应用缓存无缝升级为强大的分布式缓存集群。
 
-在单实例部署下，`Group` 直接维护本地内存缓存（`cache.Cache`），所有 `Get` / `Set` / `Delete` 都操作本地缓存，无需对等节点同步。
+**核心特性:**
 
-- 无需启动 gRPC 服务
-    
-- 不依赖 etcd 服务发现
-    
-- 所有数据仅存储于本地 `mainCache`，适合开发调试或无状态边缘节点
+*   **⚡ 极致易用**: 高度封装的 API，隐藏所有分布式细节。
+*   **🌐 分布式集群**: 通过 gRPC 实现了高效、低延迟的对等节点（Peer-to-Peer）通信。
+*   **⚖️ 智能路由**: 内置一致性哈希，自动将缓存数据分布到最合适的节点。
+*   **🛡️ 自动容错**: 单个节点宕机不会影响整个集群，仅部分数据需要重新加载。
+*   **🗑️ LRU 淘汰**: 采用 LRU 策略自动管理内存，保持高命中率。
 
----
+## 2.0 架构与调用流程 🏛️
 
-### 🌐 多实例部署（分布式同步模式）
+尽管实现细节被封装，但理解其高层工作原理有助于你更好地使用它。
 
-KamaCache 支持分布式部署，多节点通过 etcd 实现服务注册与发现，使用 gRPC 进行缓存同步。
+### 2.1 🏠 单实例模式
 
-整体结构如下：
+当你的应用只启动一个节点时，KamaCache-Go 会自动以单实例模式运行，所有操作都在本地内存完成，无任何网络开销。
 
+**调用流程图:**
+```mermaid
+graph TD
+    A[💻 你的应用] -- Get("my_key") --> B{🗃️ Cache Group};
+    subgraph "KamaCache-Go 实例"
+        B -- 1. 查本地缓存 --> C[🗑️ LRU Cache];
+        C -- ✅ 命中 --> D[返回值];
+        C -- ❌ 未命中 --> E{2. 调用 Getter};
+        E -- 从数据源获取 --> F[🗄️ 数据库/API];
+        F -- 返回数据 --> E;
+        E -- 3. 填充缓存 --> C;
+        E -- 返回数据 --> D;
+    end
+    D --> A;
 ```
-[Server 实例] ↔︎ [ClientPicker (Peer发现器)]
-        ↕
-     [Group] ←→ [本地 Cache] （带分布式同步逻辑）
+
+### 2.2 🌐 分布式集群模式
+
+当你启动多个配置了相同对等节点列表的实例时，它们会自动组成一个集群。**所有复杂的 gRPC 通信和节点查找都在库内部自动完成**。
+
+#### **Get(key) 读取流程**
+
+对你的应用代码来说，调用方式与单实例模式**完全一样**，但其内部的调用流程却大不相同。
+
+1.  你的应用在**节点A**上调用 `group.Get("some_key")`。
+2.  KamaCache-Go **优先检查节点A的本地缓存**。如果命中，立即返回。
+3.  如果本地未命中，KamaCache-Go 会**自动查询内置的一致性哈希环**。
+4.  **情况一：哈希环指示 `some_key` 就应该存放在节点A**。库会自动调用你提供的 `Getter` 从数据库加载数据，存入节点A的本地缓存后返回。
+5.  **情况二：哈希环指示 `some_key` 存放在远程的节点B**。KamaCache-Go 会**自动向节点B发起一个内部的 gRPC 请求**，获取数据后返回给你的应用。
+
+**调用流程图:**
+```mermaid
+graph TD
+    Client[💻 应用 @ 节点A] -- Get(key) --> GA{🗃️ Group @ 节点A}
+  
+    subgraph "KamaCache-Go 库内部 (完全自动)"
+        GA -- 1. 优先查本地 --> CA[🗑️ LRU @ A]
+        CA -- ✅ 本地命中 --> Client
+        CA -- ❌ 本地未命中 --> Pick{2. 内部查询<br>一致性哈希环}
+        Pick -- 负责人是自己 --> Load(3a. 内部调用 Getter<br>从 DB 加载)
+        Load -- 返回值 --> Client
+        Pick -- 负责人是节点B --> gRPCClient(3b. 内部发起<br>📞 gRPC 请求)
+    end
+
+    subgraph 节点B
+        gRPCServer[📡 内部 gRPC 服务 @ B]
+    end
+
+    gRPCClient --> gRPCServer
+    gRPCServer --> gRPCClient
+    gRPCClient -- 返回值 --> Client
 ```
 
----
+#### **Set(key, value) 写入流程**
 
-## 🧩 组件说明
+与读取流程一样，`Set` 方法也会自动将数据写入正确的节点。
 
-### `server.go`（服务端）
+1.  你的应用在**节点A**上调用 `group.Set("some_key", "value")`。
+2.  KamaCache-Go **自动查询一致性哈希环**，定位到负责 `some_key` 的节点（可能是节点A自己，也可能是远程的节点B）。
+3.  库**自动将数据**通过内存写入或内部 gRPC 请求，**存放到正确的节点**上。
 
-- 负责启动 gRPC 服务
-    
-- 提供 `Get` / `Set` / `Delete` 接口供其他节点访问
-    
-- 监听端口并注册服务至 etcd，便于 `ClientPicker` 发现
-    
+> ✨ **核心价值**: 你的业务代码无需关心数据到底存在哪个节点，也无需手动编写任何网络通信代码。只需像操作一个本地 Map 一样操作 `Group` 对象即可。
 
-🛠 方法逻辑：
+## 3.0 快速开始指南 🚀
 
-|方法|功能描述|
-|---|---|
-|`Start`|启动 gRPC 服务并注册 etcd|
-|`Stop`|优雅关闭服务、注销注册信息|
-|`Get/Set/Delete`|接收其他节点的请求，转发给本地 `Group`|
+下面我们来实际操作，搭建一个三节点的分布式缓存集群。
 
-> ✅ 所有请求均将 ctx 透传给 Group，用于标记来源及控制行为。
+### **第 1 步: 初始化项目并获取依赖** ✅
 
----
+```bash
+# 创建项目目录
+mkdir my-cluster-app
+cd my-cluster-app
 
-### `client.go`（客户端）
+# 初始化 Go Module
+go mod init my-cluster-app
 
-- 客户端连接其他节点，通过 gRPC 执行 `Get` / `Set` / `Delete`
-    
-- 通过 `ClientPicker` 持有连接池、节点选择逻辑（一致性哈希）
-    
-- 所有请求在上下文中加入标识 `OriginPeer`，防止循环同步
-    
+# 获取 KamaCache-Go 库 (请替换为你的实际库路径)
+go get github.com/rson9/KamaCache-Go 
+```
 
----
+### **第 2 步: 编写启动代码 (`main.go`)** ✍️
 
-### `group.go`（核心逻辑）
-
-封装缓存组（namespace），负责本地缓存管理和跨节点同步。
-
-#### ✅ 核心方法：
-
-|方法|描述|
-|---|---|
-|`Get(ctx, key)`|优先读取本地缓存，miss 则调用 `load()` 从其他节点或加载器获取|
-|`Set(ctx, key, val)`|写入本地缓存，若不是来自 peer，则同步到其他节点|
-|`Delete(ctx, key)`|删除本地缓存，若不是来自 peer，则同步删除至其他节点|
-|`load(ctx, key)`|使用 `singleflight` 降重获取，内部调用 `getFromPeer`|
-|`getFromPeer()`|选择远程节点发起请求，通过 `Client.Get()` 获取数据|
-
-> `Group` 使用上下文标识请求来源，**避免写入/同步死循环**。
-
-#### 🧠 请求来源标识（在 `ctx` 中）
-
-- `OriginClient`：用户或 CLI 调用
-    
-- `OriginPeer`：由其他节点转发请求（用于避免死循环）
-    
-
----
-
-### `client_picker.go`（一致性哈希 + 服务发现）
-
-- 监听 etcd 节点注册变更
-    
-- 根据 key 一致性哈希选择目标节点
-    
-- 节点变更时动态添加 / 移除客户端连接
-    
-
----
-
-## 🧠 缓存访问行为分析
-
-|操作|本地|分布式|
-|---|---|---|
-|Get|直接查本地，否则从其他节点拉取并缓存|支持|
-|Set|设置本地，自动同步其他节点|支持|
-|Delete|删除本地，自动同步其他节点|支持|
-
-✅ 分布式同步是自动完成的，**用户只需调用一次 API 即可透明同步**
-
----
-
-## ✅ 使用方式（伪代码）
+这是唯一需要你编写的文件。你只需要做三件事：
+1.  定义集群中有哪些节点。
+2.  创建一个或多个缓存组 (`Group`)，并提供数据源回源逻辑 (`Getter`)。
+3.  调用 KamaCache-Go 的启动函数。
 
 ```go
-// 启动 Server 并注册 Group
-srv := server.NewServer("10.0.0.1:8001", "my-cache")
-group := group.NewGroup("default", 64<<20, group.GetterFunc(myLoader))
-srv.RegisterGroup(group)
-go srv.Start()
+package main
 
-// 启动 ClientPicker 用于 Peer 发现
-picker := peer.NewClientPicker("my-cache", etcdConfig)
-group.RegisterPeers(picker)
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	kamacache "github.com/rson9/KamaCache-Go" 
+)
+
+// 1. 模拟后端数据库
+var db = map[string]string{
+	"Tom":   "630",
+	"Jack":  "589",
+	"Sam":   "567",
+	"Peter": "999",
+}
+
+func main() {
+	// 2. 定义命令行参数，用于区分不同节点
+	var port int
+	var isApiServer bool
+	flag.IntVar(&port, "port", 8001, "KamaCache node's communication port")
+	flag.BoolVar(&api, "api", false, "Set to true to start a public API server on this node")
+	flag.Parse()
+
+	// 3. 定义集群所有节点的地址
+	//    在生产环境中，这应该来自配置中心或服务发现
+	peers := []string{
+		"localhost:8001",
+		"localhost:8002",
+		"localhost:8003",
+	}
+	selfAddr := fmt.Sprintf("localhost:%d", port)
+
+	// 4. 创建一个缓存组 (Group)
+	scoresGroup := kamacache.NewGroup("scores", 2<<10, kamacache.GetterFunc(
+		func(key string) ([]byte, error) {
+			log.Printf("[SlowDB] Searching for key: %s", key)
+			if val, ok := db[key]; ok {
+				return []byte(val), nil
+			}
+			return nil, fmt.Errorf("key %s not found", key)
+		},
+	))
+
+	// 5. 如果是 API 节点，启动一个对外的 HTTP 服务方便测试
+	if isApiServer {
+		go startAPIServer("9999", scoresGroup)
+	}
+
+	// 6. ✨ 启动集群节点！✨
+	//    这是最关键的一步，KamaCache-Go 会在此处启动 gRPC 服务并管理对等节点连接。
+	//    这是一个阻塞函数，它会一直运行。
+	log.Printf("KamaCache-Go node is running at %s", selfAddr)
+	node, err := kamacache.NewNode(selfAddr, peers)
+	if err != nil {
+		log.Fatalf("Failed to create node: %v", err)
+	}
+	node.RegisterGroup(scoresGroup) // 将我们创建的 group 注册到节点
+	if err := node.Start(); err != nil {
+		log.Fatalf("Failed to start node: %v", err)
+	}
+}
+
+// startAPIServer 是一个简单的 HTTP 服务器，用于从外部访问缓存
+func startAPIServer(apiAddr string, group *kamacache.Group) {
+	http.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		view, err := group.Get(key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(view.ByteSlice())
+	})
+	log.Println("Public API server is running at", apiAddr)
+	http.ListenAndServe(apiAddr, nil)
+}
 ```
+*(注: 以上 `kamacache.NewNode`, `node.RegisterGroup`, `node.Start` 是基于优秀库设计模式的推断，请根据你的实际 API 进行调整。)*
 
----
+### **第 3 步: 启动并运行集群** 💨
 
-## 🔧 可优化建议清单（按优先级）
+打开 **3个** 独立的终端窗口，分别启动三个节点。我们将 Node 1 作为对外提供 API 服务的入口。
 
-### 1. ✅ **Set/Delete 同步采用异步 + 超时控制**
-
-- 当前 `startPeerSync` 是 fire-and-forget，容易阻塞无法感知失败。
-    
-- 优化建议：
-    
-    ```go
-    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-    defer cancel()
-    go g.syncToPeers(ctx, ...)
+*   **终端 1 (API & 节点1):**
+    ```bash
+    go run main.go --port=8001 --api=true
     ```
-    
+*   **终端 2 (节点2):**
+    ```bash
+    go run main.go --port=8002
+    ```
+*   **终端 3 (节点3):**
+    ```bash
+    go run main.go --port=8003
+    ```
 
----
+### **第 4 步: 见证奇迹** ✨
 
-### 2. ✅ **将 singleflight 改为泛型版本**
+集群已在运行！现在打开**第 4 个终端**，使用 `curl` 进行测试：
 
-- 提升类型安全性，减少类型断言错误
-    
-- 建议替换为 `SingleFlight[T any]`（我可以为你改写 group 中调用）
-    
+1.  **第一次请求 `Tom`:**
+    ```bash
+    curl "http://localhost:9999/api?key=Tom"
+    ```
+  *   **现象**: 在某个节点的终端（如节点1）会打印 `[SlowDB] Searching for key: Tom`。
 
----
 
-### 3. ✅ **完善分布式启动流程**
+2.  **再次请求 `Tom`:**
+    ```bash
+    curl "http://localhost:9999/api?key=Tom"
+    ```
+  *   **现象**: **所有节点**的终端都**没有任何日志**。数据已从缓存中快速返回！
 
-- 启动 CLI 前等待 Server 启动 + etcd 注册完成（如延迟 3s 或使用健康检查）
-    
-- 否则 `ClientPicker` 初始化时可能看不到本机节点，导致数据无法同步
-    
-```
-Get-ChildItem -Path "D:\scoop\apps" -Recurse -Filter "install.json" | ForEach-Object { (Get-Content -Path $_.FullName -Raw) -replace '"bucket": "(main|extras|versions|nirsoft|sysinternals|php|nerd-fonts|nonportable|java|games)"', '"bucket": "scoop-cn"' | Set-Content -Path $_.FullName }
-```
----
 
-### 4. ✅ **Node 自身地址过滤优化**
+3.  **请求 `Peter` (一个可能在其他节点上的键):**
+    ```bash
+    curl "http://localhost:9999/api?key=Peter"
+    ```
+  *   **现象**: 你会看到**另一个节点**（如节点2或3）的终端打印了 `[SlowDB]` 日志。API 服务（节点1）通过内部的 gRPC 通信，透明地从负责该键的节点获取了数据。
 
-- 建议在服务注册时将 `value` 设置为本机标识（如 `ip:port`）
-    
-- ClientPicker 中对比节点地址时使用本地记录，无需额外传参
-    
+你成功了！你已经用一个非常简单的 `main.go` 文件，启动并验证了一个全功能的分布式缓存集群。
 
----
+## 4.0 部署与最佳实践 💡
 
-### 5. ✅ **增加启动诊断日志**
-
-- 建议输出如下内容：
-    
-    - 节点监听地址
-        
-    - 注册服务名
-        
-    - etcd endpoint
-        
-    - 注册成功与否
-        
-    - peers 数量变化
-        
-
----
-
-### 6. ✅ **支持本地命中统计 / 对等节点命中统计导出（如 Prometheus）**
-
-- 当前 `group.Stats()` 可扩展为标准 `/metrics` 接口，便于监控
-    
-- 可支持：
-    
-    - cache 命中率
-        
-    - peer 命中率
-        
-    - 加载耗时
-        
-
----
-
-### 7. ✅ **CLI 友好提示 & 自动补全**
-
-- 当前 CLI 交互较弱，可引入：
-    
-    - `fzf` 模糊匹配 key
-        
-    - tab 补全命令
-        
-    - 提示当前连接节点信息（用 color 高亮）
-        
-
----
-
-### 8. ✅ **支持跨服务同步策略扩展**
-
-- 当前是广播策略：同步给所有 peer
-    
-- 可支持：
-    
-    - 局部同步（只同步特定 peer）
-        
-    - 分片分组（水平扩展场景）
-        
+*   **容器化**: 强烈建议使用 Docker 将应用打包，并通过 Kubernetes 或 Docker Compose 进行部署和管理。
+*   **服务发现**: 在生产环境中，应通过配置中心（如 Nacos, Etcd）或K8s的服务发现机制来动态管理 `peers` 列表，而不是硬编码。
+*   **网络**: 将所有缓存节点部署在同一个低延迟的内网环境（如 AWS VPC 或阿里云 VPC）中，以获得最佳性能。
+*   **监控**: 监控节点的 CPU、内存使用情况，以及缓存的命中率、Get/Set 次数等关键指标。

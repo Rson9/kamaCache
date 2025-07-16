@@ -13,6 +13,7 @@ type lru2Store struct {
 	cleanupTick *time.Ticker
 	mask        int32
 	len         int64 // 总长度
+	hash        HashFunc
 }
 
 func newLRU2Cache(opts Options) *lru2Store {
@@ -28,6 +29,9 @@ func newLRU2Cache(opts Options) *lru2Store {
 	if opts.CleanupInterval <= 0 {
 		opts.CleanupInterval = time.Minute
 	}
+	if opts.Hash == nil {
+		opts.Hash = HashWithMurmur3Library // 默认使用第三方实现的Murmur3
+	}
 
 	mask := maskOfNextPowOf2(opts.BucketCount)
 	s := &lru2Store{
@@ -36,6 +40,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 		onEvicted:   opts.OnEvicted,
 		cleanupTick: time.NewTicker(opts.CleanupInterval),
 		mask:        int32(mask),
+		hash:        opts.Hash,
 	}
 
 	for i := range s.caches {
@@ -169,15 +174,6 @@ func (s *lru2Store) Close() {
 	}
 }
 
-// 实现了 BKDR 哈希算法，用于计算键的哈希值
-func hashBKRD(s string) uint32 {
-	var hash uint32 = 0
-	for i := 0; i < len(s); i++ {
-		hash = hash*131 + uint32(s[i])
-	}
-	return hash
-}
-
 // maskOfNextPowOf2 计算大于或等于输入值的最近 2 的幂次方减一作为掩码值
 func maskOfNextPowOf2(cap uint16) uint16 {
 	if cap > 0 && cap&(cap-1) == 0 {
@@ -194,7 +190,7 @@ func maskOfNextPowOf2(cap uint16) uint16 {
 
 // 使用范例：分区键计算
 func (s *lru2Store) getBucketIndex(key string) uint32 {
-	hash := hashBKRD(key)
+	hash := s.hash(key)
 	return hash & uint32(s.mask) // 按位与，避免除零
 }
 
