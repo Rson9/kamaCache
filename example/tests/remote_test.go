@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	client "github.com/rson9/KamaCache-Go/peer"
+	client "github.com/rson9/kamaCache/peer"
 )
 
 func TestGRPCConnectivity(t *testing.T) {

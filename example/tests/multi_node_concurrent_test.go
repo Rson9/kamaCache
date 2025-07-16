@@ -3,9 +3,9 @@ package tests
 import (
 	"context"
 	"fmt"
-	"github.com/rson9/KamaCache-Go/example"
-	"github.com/rson9/KamaCache-Go/group"
-	"github.com/rson9/KamaCache-Go/server"
+	"github.com/rson9/kamaCache/example"
+	"github.com/rson9/kamaCache/group"
+	"github.com/rson9/kamaCache/server"
 	"github.com/stretchr/testify/require"
 	"sync"
 	"sync/atomic"

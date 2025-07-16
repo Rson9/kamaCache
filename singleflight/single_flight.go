@@ -3,8 +3,8 @@ package singleflight
 import (
 	"context"
 
-	"github.com/rson9/KamaCache-Go/cache"
-	"github.com/rson9/KamaCache-Go/utils"
+	"github.com/rson9/kamaCache/cache"
+	"github.com/rson9/kamaCache/utils"
 )
 
 // 代表正在进行或已结束的请求

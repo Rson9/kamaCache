@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rson9/KamaCache-Go/store"
+	"github.com/rson9/kamaCache/store"
 
 	"github.com/sirupsen/logrus"
 )

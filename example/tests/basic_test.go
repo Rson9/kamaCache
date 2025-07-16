@@ -2,8 +2,8 @@ package tests
 
 import (
 	"context"
-	"github.com/rson9/KamaCache-Go/example"
-	pb "github.com/rson9/KamaCache-Go/gen/proto/kama/v1"
+	"github.com/rson9/kamaCache/example"
+	pb "github.com/rson9/kamaCache/gen/proto/kama/v1"
 	"github.com/stretchr/testify/require"
 	"testing"
 )

@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	cache "github.com/rson9/KamaCache-Go/cache"
-	"github.com/rson9/KamaCache-Go/peer"
-	"github.com/rson9/KamaCache-Go/singleflight"
-	"github.com/rson9/KamaCache-Go/utils"
+	cache "github.com/rson9/kamaCache/cache"
+	"github.com/rson9/kamaCache/peer"
+	"github.com/rson9/kamaCache/singleflight"
+	"github.com/rson9/kamaCache/utils"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/zap"
 )

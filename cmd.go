@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rson9/KamaCache-Go/group"
-	"github.com/rson9/KamaCache-Go/peer"
-	"github.com/rson9/KamaCache-Go/server"
-	"github.com/rson9/KamaCache-Go/utils"
+	"github.com/rson9/kamaCache/group"
+	"github.com/rson9/kamaCache/peer"
+	"github.com/rson9/kamaCache/server"
+	"github.com/rson9/kamaCache/utils"
 )
 
 // Configuration flags

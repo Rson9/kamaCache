@@ -3,11 +3,11 @@ package example
 import (
 	"context"
 	"errors"
-	"github.com/rson9/KamaCache-Go/group"
+	"github.com/rson9/kamaCache/group"
 	"testing"
 
-	"github.com/rson9/KamaCache-Go/peer"
-	"github.com/rson9/KamaCache-Go/server"
+	"github.com/rson9/kamaCache/peer"
+	"github.com/rson9/kamaCache/server"
 	"github.com/stretchr/testify/require"
 )
 

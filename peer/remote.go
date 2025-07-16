@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	pb "github.com/rson9/KamaCache-Go/gen/proto/kama/v1"
-	peer "github.com/rson9/KamaCache-Go/types"
+	pb "github.com/rson9/kamaCache/gen/proto/kama/v1"
+	peer "github.com/rson9/kamaCache/types"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

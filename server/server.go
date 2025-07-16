@@ -8,10 +8,10 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/rson9/KamaCache-Go/gen/proto/kama/v1"
-	"github.com/rson9/KamaCache-Go/group"
-	"github.com/rson9/KamaCache-Go/registry"
-	"github.com/rson9/KamaCache-Go/utils"
+	pb "github.com/rson9/kamaCache/gen/proto/kama/v1"
+	"github.com/rson9/kamaCache/group"
+	"github.com/rson9/kamaCache/registry"
+	"github.com/rson9/kamaCache/utils"
 
 	"github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -268,7 +268,7 @@ func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, 
 		return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
 	}
 
-		ctx = utils.WithOrigin(ctx, utils.OriginPeer)
+	ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	// 根据找到的group,通过key去设置数据，同时必须传入ctx，因为其中包含了是其他节点的请求
 	if err := group.Set(ctx, req.Key, req.Value); err != nil {
 		logrus.Errorf("Error setting key '%s' in group '%s': %v", req.Key, req.Group, err)
@@ -284,7 +284,7 @@ func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 	if !ok || group == nil {
 		return nil, status.Errorf(codes.NotFound, "group %s not found", req.Group)
 	}
-		ctx = utils.WithOrigin(ctx, utils.OriginPeer)
+	ctx = utils.WithOrigin(ctx, utils.OriginPeer)
 	if err := group.Delete(ctx, req.Key); err != nil {
 		logrus.Errorf("Error deleting key '%s' from group '%s': %v", req.Key, req.Group, err)
 		return nil, status.Errorf(codes.Internal, "failed to delete key '%s': %v", req.Key, err)
