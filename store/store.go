@@ -40,6 +40,8 @@ type Options struct {
 	CleanupInterval time.Duration
 	// OnEvicted 指定缓存项被移除时的回调函数
 	OnEvicted func(key string, value Value)
+	// OnLenChange 当缓存长度变化时的回调函数
+	OnLengthChange func(delta int)
 }
 
 func NewOptions() Options {
@@ -50,6 +52,7 @@ func NewOptions() Options {
 		Level2Cap:       256,
 		CleanupInterval: time.Minute,
 		OnEvicted:       nil,
+		OnLengthChange:  nil,
 	}
 }
 
