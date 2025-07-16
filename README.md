@@ -23,19 +23,23 @@
 **调用流程图:**
 ```mermaid
 graph TD
-    A[💻 你的应用] -->|Get(my_key)| B{🗃️ Cache Group}
-
-    subgraph KamaCache-Go实例
-        B -->|1. 查本地缓存| C[🗑️ LRU Cache]
+    subgraph "KamaCache-Go 单实例部署"
+    A[💻 应用程序] -->|Get my_key| B{🧱 缓存组}
+        B -->|1️⃣ 缓存查询| C[📦 本地缓存]
         C -->|✅ 命中| D[返回值]
-        C -->|❌ 未命中| E{2. 调用 Getter}
-        E -->|从数据源获取| F[🗄️ 数据库或API]
-        F --> E
-        E -->|3. 填充缓存| C
+        C -->|❌ 未命中| E{2️⃣ 执行 Getter}
+        E -->|3️⃣ 写入缓存| C
         E --> D
     end
 
-    D --> A
+    subgraph "外部数据源"
+        F[🗄️ 数据库/API]
+    end
+
+    E -->|访问数据源| F
+    F --> E
+
+    D -->|响应| A
 
 ```
 
