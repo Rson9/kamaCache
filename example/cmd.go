@@ -1,4 +1,4 @@
-package main
+package example
 
 import (
 	"context"
@@ -34,7 +34,7 @@ var (
 	flagServiceAddr = flag.String("service.addr", "", "服务监听地址 (例如 :8001). 如果未提供, 将使用 --port.")
 )
 
-func main() {
+func example() {
 	flag.Parse()
 
 	// 1. address 配置
