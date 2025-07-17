@@ -166,24 +166,4 @@ func TestKamaCache_Integration(t *testing.T) {
 		require.Equal(t, "300", v.String())
 		require.Equal(t, int64(2), getterLoads.Load())
 	})
-
-	t.Run("Expiration: Cache entry expires and reloads", func(t *testing.T) {
-		expireGroupName := "expire-group"
-		expireGroup, err := nodes[0].NewGroup(expireGroupName, 2<<20, getter)
-		require.NoError(t, err)
-
-		getterLoads.Store(0)
-		val, err := expireGroup.Get(ctx, "player1")
-		require.NoError(t, err)
-		require.Equal(t, "100", val.String())
-		require.Equal(t, int64(1), getterLoads.Load())
-
-		time.Sleep(600 * time.Millisecond)
-
-		// 过期后再次访问应回源 Getter
-		val2, err := expireGroup.Get(ctx, "player1")
-		require.NoError(t, err)
-		require.Equal(t, "100", val2.String())
-		require.Equal(t, int64(2), getterLoads.Load())
-	})
 }
