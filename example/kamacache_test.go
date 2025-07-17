@@ -3,7 +3,7 @@ package kamacache_test
 import (
 	"context"
 	"fmt"
-	"github.com/rson9/kamaCache/internal/cache"
+	kamacache2 "github.com/rson9/kamaCache/kamacache"
 	"log"
 	"net"
 	"sync"
@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rson9/kamaCache"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +36,7 @@ func TestKamaCache_Integration(t *testing.T) {
 	db.Store("player3", "300")
 
 	var getterLoads atomic.Int64
-	getter := kamacache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+	getter := kamacache2.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
 		log.Printf("[Source DB] loading key: %s", key)
 		getterLoads.Add(1)
 		if v, ok := db.Load(key); ok {
@@ -48,7 +47,7 @@ func TestKamaCache_Integration(t *testing.T) {
 
 	const numNodes = 3
 	nodeAddrs := make([]string, numNodes)
-	nodes := make([]*kamacache.Node, numNodes)
+	nodes := make([]*kamacache2.Node, numNodes)
 	groupName := "player-scores"
 	var wg sync.WaitGroup
 
@@ -59,23 +58,19 @@ func TestKamaCache_Integration(t *testing.T) {
 		addr := fmt.Sprintf("localhost:%d", port)
 		nodeAddrs[i] = addr
 
-		node, err := kamacache.NewNode(
-			kamacache.WithSelfAddr(addr),
-			kamacache.WithEtcdEndpoints([]string{"http://localhost:2379"}),
-			kamacache.WithServiceName("kamacache-test"),
+		node, err := kamacache2.NewNode(
+			kamacache2.WithSelfAddr(addr),
+			kamacache2.WithEtcdEndpoints([]string{"http://localhost:2379"}),
+			kamacache2.WithServiceName("kamacache-test"),
 		)
 		require.NoError(t, err)
 		nodes[i] = node
 
-		_, err = node.RegisterGroup(groupName, getter, kamacache.GroupOptions{
-			CacheOpts: cache.CacheOptions{
-				MaxBytes: 2 << 20,
-			},
-		})
+		_, err = node.NewGroup(groupName, getter, kamacache2.WithMaxBytes(2<<20))
 		require.NoError(t, err)
 
 		wg.Add(1)
-		go func(n *kamacache.Node) {
+		go func(n *kamacache2.Node) {
 			defer wg.Done()
 			if err := n.Run(); err != nil {
 				// 优雅关闭时忽略错误

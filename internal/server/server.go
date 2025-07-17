@@ -182,7 +182,7 @@ func (s *Server) Start() error {
 		if err := s.grpcServer.Serve(lis); err != nil {
 			s.logger.Errorf("gRPC server error: %v", err)
 			errChan <- err
-			s.Stop()
+			s.Close()
 		}
 		close(errChan)
 	}()
@@ -207,7 +207,7 @@ func (s *Server) Start() error {
 		go func() {
 			if err := registry.Register(s.svcName, s.addr, s.stopCh); err != nil {
 				s.logger.Errorf("service registration failed: %v", err)
-				s.Stop() // 触发优雅关闭
+				s.Close() // 触发优雅关闭
 			}
 		}()
 	} else {
@@ -225,8 +225,8 @@ func (s *Server) Start() error {
 	}
 }
 
-// Stop 优雅关闭服务器
-func (s *Server) Stop() {
+// Close 优雅关闭服务器
+func (s *Server) Close() error {
 	s.stopOnce.Do(func() {
 		s.logger.Info("Stopping Cache Server...")
 
@@ -247,6 +247,7 @@ func (s *Server) Stop() {
 
 		s.logger.Info("Cache Server stopped.")
 	})
+	return nil
 }
 
 // Get 实现 Cache 服务的 Get 方法
