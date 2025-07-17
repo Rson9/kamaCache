@@ -28,7 +28,7 @@ func (g *Group) Get(ctx context.Context, key string) (cache.ByteView, error) {
 		return view, nil
 	}
 	atomic.AddInt64(&g.stats.localMisses, 1)
-	g.logger.Info("[Test] key=%s, picking peer...", key)
+	g.logger.Infof("[Test] key=%s, picking peer...", key)
 	// 2. 本地未命中，调用统一的 load 方法
 	return g.load(ctx, key)
 }
