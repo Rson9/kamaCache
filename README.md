@@ -100,8 +100,8 @@ graph TD
 
 ### ✅ 适用范围
 
-> 当前示例仅支持 **本地运行模式**，不依赖网络分布式环境，适合本地开发调试。未来版本将提供自动封装的分布式部署方式。
-
+> 支持 **本地运行模式**，不依赖网络分布式环境，适合本地开发调试。
+> 支持 **分布式运行模式** ，节点间依赖ETCD进行管理，适合生产环境部署。
 
 ### **第 1 步: 初始化项目并获取依赖** ✅
 
@@ -132,91 +132,76 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"sync"
+	"time"
 
-	kamacache "github.com/rson9/kamaCache/group"
+	"github.com/rson9/kamaCache/kamacache"
 )
 
-// CacheManager 支持多个 Group，且支持 Set 和 Get 操作
-type CacheManager struct {
-	mu     sync.RWMutex
-	groups map[string]*kamacache.Group
-}
-
-func NewCacheManager() *CacheManager {
-	return &CacheManager{
-		groups: make(map[string]*kamacache.Group),
-	}
-}
-
-func (cm *CacheManager) AddGroup(name string, cacheBytes int64, getter kamacache.Getter) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if _, exists := cm.groups[name]; exists {
-		return fmt.Errorf("group %s 已存在", name)
-	}
-	group := kamacache.NewGroup(name, cacheBytes, getter)
-	cm.groups[name] = group
-	log.Printf("新增缓存组: %s, 缓存大小: %d 字节", name, cacheBytes)
-	return nil
-}
-
-func (cm *CacheManager) GetGroup(name string) (*kamacache.Group, bool) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	group, ok := cm.groups[name]
-	return group, ok
-}
-
 func main() {
-	cm := NewCacheManager()
+	const (
+		nodeCount = 3
+		groupName = "player-scores"
+	)
 
-	// 创建一个示例缓存组
-	_ = cm.AddGroup("scores", 2<<20, kamacache.GetterFunc(
-		func(ctx context.Context, key string) ([]byte, error) {
-			log.Printf("[Getter-scores] 加载 key: %s", key)
-			return []byte("score_for_" + key), nil
-		}))
+	// 这里简单演示如何启动多个节点
+	var nodes []*kamacache.Node
+	var wg sync.WaitGroup
 
-	// HTTP 接口支持 GET / SET 操作
-	http.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
-		groupName := r.URL.Query().Get("group")
-		key := r.URL.Query().Get("key")
-		op := r.URL.Query().Get("op") // get 或 set
-		value := r.URL.Query().Get("value")
-
-		group, ok := cm.GetGroup(groupName)
-		if !ok {
-			http.Error(w, "group 不存在", http.StatusBadRequest)
-			return
+	for i := 0; i < nodeCount; i++ {
+		addr := fmt.Sprintf("localhost:%d", 8000+i)
+		node, err := kamacache.NewNode(
+			kamacache.WithSelfAddr(addr),
+			kamacache.WithEtcdEndpoints([]string{"http://localhost:2379"}),
+			kamacache.WithServiceName("kamacache-test"),
+		)
+		if err != nil {
+			log.Fatalf("创建节点失败: %v", err)
 		}
 
-		switch op {
-		case "get":
-			view, ok := group.Get(context.Background(), key)
-			if !ok {
-				http.Error(w, "key 未命中或加载失败", http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Type", "application/octet-stream")
-			w.Write(view.ByteSlice())
-		case "set":
-			err := group.Set(context.Background(), key, []byte(value))
-			if err != nil {
-				http.Error(w, "Set 失败: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			fmt.Fprintf(w, "Set 成功，key=%s, value=%s\n", key, value)
-		default:
-			http.Error(w, "不支持的操作，请使用 op=get 或 op=set", http.StatusBadRequest)
+		// 为每个节点创建并注册 Group
+		_, err = node.NewGroup(groupName, kamacache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+			log.Printf("[%s] 加载 key=%s", addr, key)
+			return []byte(fmt.Sprintf("value_for_%s", key)), nil
+		}), kamacache.WithMaxBytes(2<<20))
+		if err != nil {
+			log.Fatalf("创建缓存组失败: %v", err)
 		}
-	})
 
-	log.Println("🟢 本地缓存服务启动成功，监听地址: http://localhost:9999")
-	log.Fatal(http.ListenAndServe(":9999", nil))
+		nodes = append(nodes, node)
+
+		wg.Add(1)
+		go func(n *kamacache.Node) {
+			defer wg.Done()
+			if err := n.Run(); err != nil {
+				log.Printf("节点运行失败: %v", err)
+			}
+		}(node)
+	}
+
+	// 等待节点完成启动并通过 Etcd 发现彼此
+	time.Sleep(3 * time.Second)
+
+	// 这里可以对任一节点的 Group 进行操作
+	group := nodes[0].GetGroup(groupName)
+	if group == nil {
+		log.Fatal("缓存组未找到")
+	}
+
+	// 演示简单 Get 操作
+	val, err := group.Get(context.Background(), "testkey")
+	if err != nil {
+		log.Fatalf("Get 失败: %v", err)
+	}
+	log.Printf("获取 key=testkey 的值: %s", val.String())
+
+	// 关闭所有节点
+	for _, node := range nodes {
+		node.Shutdown()
+	}
+	wg.Wait()
 }
+
 ```
 
 
@@ -225,40 +210,6 @@ func main() {
 ```bash
 go run main.go
 ```
-
-
-### **第 4 步: 使用 curl 验证缓存操作** 🧪
-
-#### ✅ 设置一个缓存值
-
-```bash
-curl "http://localhost:9999/cache?group=scores&op=set&key=Tom&value=700"
-```
-> ✅ 输出: `Set 成功，key=Tom, value=700`
-
-
-#### ✅ 读取一个缓存值
-
-```bash
-curl "http://localhost:9999/cache?group=scores&op=get&key=Tom"
-```
-> ✅ 输出: `700`
-
-
-#### ✅ 测试自动回源 Getter
-
-```bash
-curl "http://localhost:9999/cache?group=scores&op=get&key=Jerry"
-```
-
-> ✅ 输出: `score_for_Jerry`（命中 getter）
-
-
-### 📦 当前运行模式说明
-
-* 本示例运行在 **本地缓存模式**
-* 适用于学习、开发和调试场景
-* 后续将扩展支持 **Etcd 注册**、**多节点部署**、**自动服务发现**
 
 
 ## 4.0 部署与最佳实践 💡
@@ -281,13 +232,13 @@ curl "http://localhost:9999/cache?group=scores&op=get&key=Jerry"
 | 🌐 **一致性哈希算法**              | 内置一致性哈希（支持多个 hash 函数），实现分布式数据负载均衡，支持虚拟节点数配置  |
 | 📡 **服务发现与注册 (Etcd)**       | 可选集成 Etcd，自动注册服务并发现其它节点，支持用户名/密码、连接超时等配置     |
 | 📈 **缓存统计信息**               | 每个 Group 支持缓存命中率、淘汰次数、回源次数、远程请求等详细指标输出       |
+| 🧩 **服务封装简化 (Builder API)** | 提供统一启动函数（如 `StartServerWithGroups`），自动完成 Group 注册、Peer Picker 配置等逻辑 |
 
 
 ### 🚧 规划中功能（开发中 / 排期中）
 
 | 模块                          | 描述                                                                  |
 | --------------------------- | ------------------------------------------------------------------- |
-| 🧩 **服务封装简化 (Builder API)** | 提供统一启动函数（如 `StartServerWithGroups`），自动完成 Group 注册、Peer Picker 配置等逻辑 |
 | 🎛️ **配置友好化 (YAML/TOML)**   | 提供 YAML / JSON / TOML 配置文件加载，降低部署门槛，支持配置缓存策略、组定义、etcd 参数等           |
 | 🧭 **动态策略热更新**              | 支持运行时修改 Group 策略（如 LRU -> LRU2），缓存策略更灵活                             |
 | ☁️ **容器化部署与 K8s 支持**        | 提供官方 Dockerfile 与 Helm Chart，快速部署至生产环境                              |
@@ -308,4 +259,5 @@ curl "http://localhost:9999/cache?group=scores&op=get&key=Jerry"
 欢迎创建 Issue、PR 或邮件联系我们！
 
 📍 GitHub: [https://github.com/rson9/kamaCache](https://github.com/rson9/kamaCache)
+
 📧 Email: *[1302018451@qq.com](mailto:1302018451@qq.com)*
