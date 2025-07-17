@@ -44,9 +44,16 @@ func DefaultCacheOptions() CacheOptions {
 }
 
 // NewCache 创建一个新的缓存实例
-func NewCache(opts CacheOptions) *Cache {
+// NewCache 创建一个缓存实例，opts 可选，传空则用默认配置
+func NewCache(opts ...CacheOptions) *Cache {
+	var co CacheOptions
+	if len(opts) == 0 {
+		co = DefaultCacheOptions()
+	} else {
+		co = opts[0]
+	}
 	return &Cache{
-		opts: opts,
+		opts: co,
 	}
 }
 

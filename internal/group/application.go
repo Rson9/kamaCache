@@ -32,7 +32,7 @@ type Group struct {
 	expiration time.Duration // 缓存过期时间，0表示永不过期
 	closed     int32         // 原子变量，标记组是否已关闭
 	stats      groupStats    // 统计信息
-	logger     *logrus.Entry // ★ 新增: 为 group 增加独立的 logger
+	logger     *logrus.Entry //为 group 增加独立的 logger
 }
 
 // groupStats 保存组的统计信息
@@ -47,61 +47,93 @@ type groupStats struct {
 	loadDuration int64 // 加载总耗时（纳秒）
 }
 
-// GroupOption 定义Group的配置选项
-type GroupOption func(*Group)
+type GroupOptions struct {
+	Expiration time.Duration
+	CacheOpts  cache.CacheOptions
+	Logger     *logrus.Entry
+	picker     peer.PeerPicker
+}
 
-// WithExpiration 设置缓存过期时间
-func WithExpiration(d time.Duration) GroupOption {
-	return func(g *Group) {
-		g.expiration = d
+// GroupOption 定义Group的配置选项
+type GroupOption interface {
+	apply(*GroupOptions)
+}
+
+type FuncGroupOption struct {
+	f func(*GroupOptions)
+}
+
+func (fo FuncGroupOption) apply(option *GroupOptions) {
+	fo.f(option)
+}
+
+func DefaultGroupOptions() GroupOptions {
+	return GroupOptions{
+		Expiration: 0,
+		CacheOpts:  cache.DefaultCacheOptions(),
+		Logger:     logrus.WithField("component", "group"),
 	}
 }
 
 // WithPeers 设置节点发现器
-func WithPeers(picker peer.PeerPicker) GroupOption {
-	return func(g *Group) {
-		g.picker = picker
+func WithPicker(picker peer.PeerPicker) GroupOption {
+	return FuncGroupOption{
+		f: func(options *GroupOptions) {
+			options.picker = picker
+		},
+	}
+}
+
+// WithLogger 设置日志记录器
+func WithLogger(logger *logrus.Entry) GroupOption {
+	return FuncGroupOption{
+		f: func(options *GroupOptions) {
+			options.Logger = logger
+		},
 	}
 }
 
 // WithCacheOptions 设置缓存选项
 func WithCacheOptions(opts cache.CacheOptions) GroupOption {
-	return func(g *Group) {
-		g.mainCache = cache.NewCache(opts)
+	return FuncGroupOption{
+		f: func(options *GroupOptions) {
+			options.CacheOpts = opts
+		},
 	}
 }
 
 // NewGroup 创建一个新的 Group 实例
-func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption) *Group {
+func NewGroup(name string, getter Getter, opts ...GroupOption) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
+	if name == "" {
+		panic("empty group name")
+	}
 
-	// 创建默认缓存选项
-	cacheOpts := cache.DefaultCacheOptions()
-	cacheOpts.MaxBytes = cacheBytes
+	// 默认8MB
+	options := DefaultGroupOptions()
+	for _, opt := range opts {
+		opt.apply(&options)
+	}
 
 	g := &Group{
 		name:      name,
 		getter:    getter,
-		mainCache: cache.NewCache(cacheOpts),
+		mainCache: cache.NewCache(options.CacheOpts),
+		picker:    options.picker,
 		loader:    &singleflight.Group{},
-		logger:    logrus.WithField("group", name),
+		stats:     groupStats{},
+		logger:    options.Logger,
 	}
 
-	// 应用选项
-	for _, opt := range opts {
-		opt(g)
-	}
-
-	// 注册到全局组映射
+	// 注册到全局
 	groupsMu.Lock()
 	defer groupsMu.Unlock()
 	if _, exists := groups[name]; exists {
 		g.logger.Warnf("Group with name %s already exists, will be replaced", name)
 	}
 	groups[name] = g
-	g.logger.Infof("Cache group created (cacheBytes=%d, expiration=%v)", cacheBytes, g.expiration)
 
 	return g
 }

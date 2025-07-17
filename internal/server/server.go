@@ -35,66 +35,64 @@ type Server struct {
 	stopCh     chan struct{}
 	stopOnce   sync.Once
 	opts       *ServerOptions
+	logger     *logrus.Entry
+}
+
+type TLSConfig struct {
+	Enabled  bool
+	CertFile string
+	KeyFile  string
 }
 
 // ServerOptions 服务器配置选项
 type ServerOptions struct {
 	EtcdConfig clientv3.Config
 	MaxMsgSize int
-	TLS        bool
-	CertFile   string
-	KeyFile    string
+	TLS        TLSConfig
 }
 
-var DefaultServerOptions = &ServerOptions{
-	EtcdConfig: clientv3.Config{
-		Endpoints:   []string{"localhost:2379"},
-		Username:    "",
-		Password:    "",
-		DialTimeout: 5 * time.Second,
-	},
-	MaxMsgSize: 4 << 20, // 4MB
+func DefaultServerOptions() ServerOptions {
+	return ServerOptions{
+		EtcdConfig: clientv3.Config{
+			Endpoints:   []string{"localhost:2379"},
+			DialTimeout: 5 * time.Second,
+		},
+		MaxMsgSize: 4 << 20, // 4MB
+		TLS: TLSConfig{
+			Enabled:  false,
+			CertFile: "",
+			KeyFile:  "",
+		},
+	}
 }
 
 // ServerOption 定义选项函数类型
 type ServerOption func(*ServerOptions)
+
+func WithTLS(certFile, keyFile string) ServerOption {
+	return func(o *ServerOptions) {
+		o.TLS = TLSConfig{
+			Enabled:  true,
+			CertFile: certFile,
+			KeyFile:  keyFile,
+		}
+	}
+}
 
 func WithEtcdEndpoints(endpoints []string) ServerOption {
 	return func(o *ServerOptions) {
 		o.EtcdConfig.Endpoints = endpoints
 	}
 }
-func WithEtcdUsername(username string) ServerOption {
-	return func(o *ServerOptions) {
-		o.EtcdConfig.Username = username
-	}
-}
-func WithEtcdPassword(password string) ServerOption {
-	return func(o *ServerOptions) {
-		o.EtcdConfig.Password = password
-	}
-}
-func WithDialTimeout(timeout time.Duration) ServerOption {
-	return func(o *ServerOptions) {
-		o.EtcdConfig.DialTimeout = timeout
-	}
-}
+
 func WithMaxMsgSize(size int) ServerOption {
 	return func(o *ServerOptions) {
 		o.MaxMsgSize = size
 	}
 }
-func WithTLS(certFile, keyFile string) ServerOption {
-	return func(o *ServerOptions) {
-		o.TLS = true
-		o.CertFile = certFile
-		o.KeyFile = keyFile
-	}
-}
 
-// NewServer 创建新的服务器实例
 func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
-	options := *DefaultServerOptions
+	options := DefaultServerOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -109,7 +107,6 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	var etcdCli *clientv3.Client
 	var err error
 	if len(options.EtcdConfig.Endpoints) > 0 {
-		logrus.Infof("etcd endpoints: %v", options.EtcdConfig.Endpoints)
 		etcdCli, err = clientv3.New(options.EtcdConfig)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create etcd client: %w", err)
@@ -119,8 +116,9 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	var grpcOpts []grpc.ServerOption
 	grpcOpts = append(grpcOpts, grpc.MaxRecvMsgSize(options.MaxMsgSize))
 
-	if options.TLS {
-		creds, err := loadTLSCredentials(options.CertFile, options.KeyFile)
+	// TLS 控制
+	if options.TLS.Enabled {
+		creds, err := loadTLSCredentials(options.TLS.CertFile, options.TLS.KeyFile)
 		if err != nil {
 			if etcdCli != nil {
 				_ = etcdCli.Close()
@@ -142,6 +140,9 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 		etcdCli:    etcdCli,
 		stopCh:     make(chan struct{}),
 		opts:       &options,
+		logger: logrus.
+			StandardLogger().
+			WithField("component", "server"),
 	}
 
 	kamapb.RegisterKamaCacheServiceServer(grpcServer, srv)
@@ -169,7 +170,7 @@ func (s *Server) RegisterGroup(g *group.Group) error {
 func (s *Server) Start() error {
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
-		logrus.Errorf("failed to listen on %s: %v", s.addr, err)
+		s.logger.Errorf("failed to listen on %s: %v", s.addr, err)
 		return err
 	}
 
@@ -177,9 +178,9 @@ func (s *Server) Start() error {
 
 	// 启动 gRPC 服务（异步）
 	go func() {
-		logrus.Infof("Starting gRPC server on %s...", s.addr)
+		s.logger.Infof("Starting gRPC server on %s...", s.addr)
 		if err := s.grpcServer.Serve(lis); err != nil {
-			logrus.Errorf("gRPC server error: %v", err)
+			s.logger.Errorf("gRPC server error: %v", err)
 			errChan <- err
 			s.Stop()
 		}
@@ -195,7 +196,7 @@ func (s *Server) Start() error {
 			break // 端口已监听
 		}
 		if i == maxRetries-1 {
-			logrus.Errorf("gRPC server did not start listening on %s after %d attempts", s.addr, maxRetries)
+			s.logger.Errorf("gRPC server did not start listening on %s after %d attempts", s.addr, maxRetries)
 			return fmt.Errorf("gRPC server listen timeout on %s", s.addr)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -205,15 +206,15 @@ func (s *Server) Start() error {
 	if s.etcdCli != nil {
 		go func() {
 			if err := registry.Register(s.svcName, s.addr, s.stopCh); err != nil {
-				logrus.Errorf("service registration failed: %v", err)
+				s.logger.Errorf("service registration failed: %v", err)
 				s.Stop() // 触发优雅关闭
 			}
 		}()
 	} else {
-		logrus.Warnf("no ETCD client, service '%s' will not register", s.svcName)
+		s.logger.Warnf("no ETCD client, service '%s' will not register", s.svcName)
 	}
 
-	logrus.Infof("Cache Server started at %s for service '%s'", s.addr, s.svcName)
+	s.logger.Infof("Cache Server started at %s for service '%s'", s.addr, s.svcName)
 
 	// 等待停止信号或 gRPC 错误
 	select {
@@ -227,24 +228,24 @@ func (s *Server) Start() error {
 // Stop 优雅关闭服务器
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
-		logrus.Info("Stopping Cache Server...")
+		s.logger.Info("Stopping Cache Server...")
 
 		close(s.stopCh)
 
 		if s.grpcServer != nil {
 			s.grpcServer.GracefulStop()
-			logrus.Info("gRPC server stopped.")
+			s.logger.Info("gRPC server stopped.")
 		}
 
 		if s.etcdCli != nil {
 			if err := s.etcdCli.Close(); err != nil {
-				logrus.Errorf("Error closing etcd client: %v", err)
+				s.logger.Errorf("Error closing etcd client: %v", err)
 			} else {
-				logrus.Info("ETCD client closed.")
+				s.logger.Info("ETCD client closed.")
 			}
 		}
 
-		logrus.Info("Cache Server stopped.")
+		s.logger.Info("Cache Server stopped.")
 	})
 }
 
@@ -261,7 +262,7 @@ func (s *Server) Get(ctx context.Context, req *kamapb.GetRequest) (*kamapb.GetRe
 	// 调用 GetLocally，只从本地缓存中获取数据，不触发新一轮同步
 	view, err := group.GetLocally(ctx, req.Key)
 	if err != nil {
-		logrus.WithError(err).Warnf("Failed to get key '%s' in group '%s' for peer request", req.Key, req.Group)
+		s.logger.WithError(err).Warnf("Failed to get key '%s' in group '%s' for peer request", req.Key, req.Group)
 		return nil, status.Errorf(codes.NotFound, "key not found or error loading")
 	}
 
@@ -278,7 +279,7 @@ func (s *Server) Set(ctx context.Context, req *kamapb.SetRequest) (*kamapb.SetRe
 	// 调用 SetLocally，只更新本地缓存，不触发新一轮同步
 	group.SetLocally(req.Key, cache.NewByteView(req.Value))
 
-	logrus.Debugf("Handled peer SET request for key '%s' in group '%s'", req.Key, req.Group)
+	s.logger.Debugf("Handled peer SET request for key '%s' in group '%s'", req.Key, req.Group)
 
 	// 之前返回的是 req.Value，这里改为返回一个简单的成功响应
 	return &kamapb.SetResponse{}, nil
@@ -294,7 +295,7 @@ func (s *Server) Delete(ctx context.Context, req *kamapb.DeleteRequest) (*kamapb
 	// 调用 DeleteLocally，只删除本地缓存，不触发新一轮同步
 	group.DeleteLocally(req.Key)
 
-	logrus.Debugf("Handled peer DELETE request for key '%s' in group '%s'", req.Key, req.Group)
+	s.logger.Debugf("Handled peer DELETE request for key '%s' in group '%s'", req.Key, req.Group)
 
 	return &kamapb.DeleteResponse{Value: true}, nil
 }

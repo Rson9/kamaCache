@@ -3,6 +3,7 @@ package kamacache_test
 import (
 	"context"
 	"fmt"
+	"github.com/rson9/kamaCache/internal/cache"
 	"log"
 	"net"
 	"sync"
@@ -66,7 +67,11 @@ func TestKamaCache_Integration(t *testing.T) {
 		require.NoError(t, err)
 		nodes[i] = node
 
-		_, err = node.NewGroup(groupName, 1024*1024, getter)
+		_, err = node.RegisterGroup(groupName, getter, kamacache.GroupOptions{
+			CacheOpts: cache.CacheOptions{
+				MaxBytes: 2 << 20,
+			},
+		})
 		require.NoError(t, err)
 
 		wg.Add(1)
