@@ -1,12 +1,8 @@
-// 文件: kamacache/kamacache.go
 package kamacache
 
 import (
 	"errors"
 	"fmt"
-	"io"
-	"sync"
-	// 导入所有需要的 internal 包
 	"github.com/rson9/kamaCache/internal/cache"
 	"github.com/rson9/kamaCache/internal/group"
 	"github.com/rson9/kamaCache/internal/peer"
@@ -14,6 +10,8 @@ import (
 	"github.com/rson9/kamaCache/internal/server"
 	"github.com/rson9/kamaCache/internal/store"
 	"github.com/sirupsen/logrus"
+	"io"
+	"sync"
 )
 
 // Node 是 kamaCache 集群的节点。
