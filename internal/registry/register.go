@@ -25,10 +25,23 @@ var DefaultConfig = &Config{
 	DialTimeout: 5 * time.Second,
 }
 
-// Register 注册服务到etcd
-func Register(svcName, addr string, stopCh <-chan struct{}) error {
+// Register 注册服务到 etcd。
+func Register(svcName, addr string, endpoints []string, leaseTTL time.Duration, stopCh <-chan struct{}) error {
+	if svcName == "" {
+		return fmt.Errorf("service name is required")
+	}
+	if addr == "" {
+		return fmt.Errorf("service address is required")
+	}
+	if len(endpoints) == 0 {
+		endpoints = DefaultConfig.Endpoints
+	}
+	if leaseTTL <= 0 {
+		leaseTTL = 10 * time.Second
+	}
+
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   DefaultConfig.Endpoints,
+		Endpoints:   endpoints,
 		DialTimeout: DefaultConfig.DialTimeout,
 	})
 	if err != nil {
@@ -40,12 +53,16 @@ func Register(svcName, addr string, stopCh <-chan struct{}) error {
 		cli.Close()
 		return fmt.Errorf("failed to get local IP: %v", err)
 	}
-	if addr[0] == ':' {
+	if len(addr) > 0 && addr[0] == ':' {
 		addr = fmt.Sprintf("%s%s", localIP, addr)
 	}
 
 	// 创建租约
-	lease, err := cli.Grant(context.Background(), 10) // 增加租约时间到10秒
+	leaseSeconds := int64(leaseTTL / time.Second)
+	if leaseSeconds < 1 {
+		leaseSeconds = 1
+	}
+	lease, err := cli.Grant(context.Background(), leaseSeconds)
 	if err != nil {
 		cli.Close()
 		return fmt.Errorf("failed to create lease: %v", err)

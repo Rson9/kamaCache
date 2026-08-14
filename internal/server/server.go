@@ -46,9 +46,10 @@ type TLSConfig struct {
 
 // ServerOptions 服务器配置选项
 type ServerOptions struct {
-	EtcdConfig clientv3.Config
-	MaxMsgSize int
-	TLS        TLSConfig
+	EtcdConfig   clientv3.Config
+	EtcdLeaseTTL time.Duration
+	MaxMsgSize   int
+	TLS          TLSConfig
 }
 
 func DefaultServerOptions() ServerOptions {
@@ -57,7 +58,8 @@ func DefaultServerOptions() ServerOptions {
 			Endpoints:   []string{"localhost:2379"},
 			DialTimeout: 5 * time.Second,
 		},
-		MaxMsgSize: 4 << 20, // 4MB
+		EtcdLeaseTTL: 10 * time.Second,
+		MaxMsgSize:   4 << 20, // 4MB
 		TLS: TLSConfig{
 			Enabled:  false,
 			CertFile: "",
@@ -82,6 +84,12 @@ func WithTLS(certFile, keyFile string) ServerOption {
 func WithEtcdEndpoints(endpoints []string) ServerOption {
 	return func(o *ServerOptions) {
 		o.EtcdConfig.Endpoints = endpoints
+	}
+}
+
+func WithEtcdLeaseTTL(ttl time.Duration) ServerOption {
+	return func(o *ServerOptions) {
+		o.EtcdLeaseTTL = ttl
 	}
 }
 
@@ -205,7 +213,7 @@ func (s *Server) Start() error {
 	// 启动服务注册（异步）
 	if s.etcdCli != nil {
 		go func() {
-			if err := registry.Register(s.svcName, s.addr, s.stopCh); err != nil {
+			if err := registry.Register(s.svcName, s.addr, s.opts.EtcdConfig.Endpoints, s.opts.EtcdLeaseTTL, s.stopCh); err != nil {
 				s.logger.Errorf("service registration failed: %v", err)
 				s.Close() // 触发优雅关闭
 			}

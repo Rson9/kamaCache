@@ -6,12 +6,14 @@ import (
 	kamacache2 "github.com/rson9/kamaCache/kamacache"
 	"log"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.etcd.io/etcd/server/v3/embed"
 )
 
 // getFreePort 请求操作系统分配一个空闲 TCP 端口
@@ -28,7 +30,48 @@ func getFreePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
+func startEmbeddedEtcd(t *testing.T) string {
+	t.Helper()
+
+	clientPort, err := getFreePort()
+	require.NoError(t, err)
+	peerPort, err := getFreePort()
+	require.NoError(t, err)
+
+	clientURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", clientPort))
+	require.NoError(t, err)
+	peerURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", peerPort))
+	require.NoError(t, err)
+
+	cfg := embed.NewConfig()
+	cfg.Name = "kamacache-test-etcd"
+	cfg.Dir = t.TempDir()
+	cfg.Logger = "zap"
+	cfg.LogLevel = "error"
+	cfg.ListenClientUrls = []url.URL{*clientURL}
+	cfg.AdvertiseClientUrls = []url.URL{*clientURL}
+	cfg.ListenPeerUrls = []url.URL{*peerURL}
+	cfg.AdvertisePeerUrls = []url.URL{*peerURL}
+	cfg.InitialCluster = fmt.Sprintf("%s=%s", cfg.Name, peerURL.String())
+	cfg.ClusterState = "new"
+
+	etcd, err := embed.StartEtcd(cfg)
+	require.NoError(t, err)
+	t.Cleanup(etcd.Close)
+
+	select {
+	case <-etcd.Server.ReadyNotify():
+	case <-time.After(10 * time.Second):
+		etcd.Close()
+		t.Fatal("embedded etcd did not become ready")
+	}
+
+	return clientURL.String()
+}
+
 func TestKamaCache_Integration(t *testing.T) {
+	etcdEndpoint := startEmbeddedEtcd(t)
+
 	// 模拟数据库，支持并发访问
 	var db sync.Map
 	db.Store("player1", "100")
@@ -60,7 +103,7 @@ func TestKamaCache_Integration(t *testing.T) {
 
 		node, err := kamacache2.NewNode(
 			kamacache2.WithSelfAddr(addr),
-			kamacache2.WithEtcdEndpoints([]string{"http://localhost:2379"}),
+			kamacache2.WithEtcdEndpoints([]string{etcdEndpoint}),
 			kamacache2.WithServiceName("kamacache-test"),
 		)
 		require.NoError(t, err)

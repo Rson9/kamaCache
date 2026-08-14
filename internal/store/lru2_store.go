@@ -11,6 +11,9 @@ type lru2Store struct {
 	caches      [][2]*cache
 	onEvicted   func(key string, value Value)
 	cleanupTick *time.Ticker
+	stopCh      chan struct{}
+	closeOnce   sync.Once
+	cleanupWG   sync.WaitGroup
 	mask        int32
 	len         int64 // 总长度
 	hash        HashFunc
@@ -30,7 +33,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 		opts.CleanupInterval = time.Minute
 	}
 	if opts.Hash == nil {
-		opts.Hash = HashWithMurmur3Library // 默认使用第三方实现的Murmur3
+		opts.Hash = HashWithMurmur3Library // 默认使用本地 Murmur3 实现
 	}
 
 	mask := maskOfNextPowOf2(opts.BucketCount)
@@ -39,6 +42,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 		caches:      make([][2]*cache, mask+1),
 		onEvicted:   opts.OnEvicted,
 		cleanupTick: time.NewTicker(opts.CleanupInterval),
+		stopCh:      make(chan struct{}),
 		mask:        int32(mask),
 		hash:        opts.Hash,
 	}
@@ -57,6 +61,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 	}
 
 	if opts.CleanupInterval > 0 {
+		s.cleanupWG.Add(1)
 		go s.cleanupLoop()
 	}
 
@@ -169,9 +174,13 @@ func (s *lru2Store) Len() int {
 
 // Close 关闭缓存相关资源
 func (s *lru2Store) Close() {
-	if s.cleanupTick != nil {
-		s.cleanupTick.Stop()
-	}
+	s.closeOnce.Do(func() {
+		if s.cleanupTick != nil {
+			s.cleanupTick.Stop()
+		}
+		close(s.stopCh)
+		s.cleanupWG.Wait()
+	})
 }
 
 // maskOfNextPowOf2 计算大于或等于输入值的最近 2 的幂次方减一作为掩码值
@@ -196,13 +205,19 @@ func (s *lru2Store) getBucketIndex(key string) uint32 {
 
 // cleanupLoop 清理过期项的定时任务
 func (s *lru2Store) cleanupLoop() {
-	for range s.cleanupTick.C {
-		currentTime := Now()
-		for i := range s.caches {
-			s.locks[i].Lock()
-			s.caches[i][0].removeExpired(currentTime)
-			s.caches[i][1].removeExpired(currentTime)
-			s.locks[i].Unlock()
+	defer s.cleanupWG.Done()
+	for {
+		select {
+		case <-s.cleanupTick.C:
+			currentTime := Now()
+			for i := range s.caches {
+				s.locks[i].Lock()
+				s.caches[i][0].removeExpired(currentTime)
+				s.caches[i][1].removeExpired(currentTime)
+				s.locks[i].Unlock()
+			}
+		case <-s.stopCh:
+			return
 		}
 	}
 }

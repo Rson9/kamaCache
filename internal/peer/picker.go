@@ -21,6 +21,8 @@ type ConsistentHashPicker struct {
 	cancel     context.CancelFunc
 	logger     *logrus.Entry
 	wg         sync.WaitGroup
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // ConsistentHashPicker 实现了 PeerPicker 接口。
@@ -63,6 +65,13 @@ func NewConsistentHashPicker(selfAddr string, discoverer discovery.Discoverer, o
 		hashRing:   consistenthash.New(), // 可在此处使用 options.virtualNodes
 		cancel:     cancel,
 		logger:     options.logger.WithField("component", "peer_picker"),
+	}
+	// 当前节点也必须位于哈希环中。若每个节点只把远端节点加入哈希环，
+	// 同一个 key 在不同入口节点上会得到不同的负责人，导致 Set 后的
+	// Get 可能再次绕过实际写入节点并回源。
+	if err := picker.hashRing.Add(selfAddr); err != nil {
+		cancel()
+		return nil, err
 	}
 
 	// 启动后台 goroutine 来同步节点信息
@@ -180,29 +189,34 @@ func (p *ConsistentHashPicker) Addr() string {
 
 // Close 停止服务发现并关闭所有与对等节点的连接
 func (p *ConsistentHashPicker) Close() error {
-	p.logger.Info("Closing peer picker...")
-	p.cancel()  // 停止 syncPeers goroutine
-	p.wg.Wait() // 等待 goroutine 真正退出
+	p.closeOnce.Do(func() {
+		p.logger.Info("Closing peer picker...")
+		p.cancel()  // 停止 syncPeers goroutine
+		p.wg.Wait() // 等待 goroutine 真正退出
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+		p.mu.Lock()
+		defer p.mu.Unlock()
 
-	// 关闭所有远程连接
-	for addr, peer := range p.peers {
-		if err := peer.Close(); err != nil {
-			p.logger.Warnf("Failed to close connection to peer %s: %v", addr, err)
+		// 关闭所有远程连接
+		for addr, peer := range p.peers {
+			if err := peer.Close(); err != nil {
+				p.logger.Warnf("Failed to close connection to peer %s: %v", addr, err)
+			}
 		}
-	}
-	p.peers = nil
-	p.hashRing = nil
-
-	// 关闭发现者
-	if p.discoverer != nil {
-		if err := p.discoverer.Close(); err != nil {
-			p.logger.WithError(err).Error("Failed to close discoverer")
-			return err // 如果需要，可以向上传递错误
+		p.peers = nil
+		if p.hashRing != nil {
+			p.hashRing.Close()
+			p.hashRing = nil
 		}
-	}
-	p.logger.Info("Peer picker closed.")
-	return nil
+
+		// 关闭发现者
+		if p.discoverer != nil {
+			if err := p.discoverer.Close(); err != nil {
+				p.logger.WithError(err).Error("Failed to close discoverer")
+				p.closeErr = err
+			}
+		}
+		p.logger.Info("Peer picker closed.")
+	})
+	return p.closeErr
 }

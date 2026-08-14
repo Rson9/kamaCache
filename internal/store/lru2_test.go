@@ -116,12 +116,11 @@ func TestLRU2Cache_Expiration(t *testing.T) {
 			return rig.store.Len() == 0
 		}, 1*time.Second, 10*time.Millisecond)
 
-		// 打印用于调试
-		t.Logf("回调被触发的 key：%v", rig.evictedKeys)
-
 		rig.mu.Lock()
+		evictedKeys := append([]string(nil), rig.evictedKeys...)
 		defer rig.mu.Unlock()
-		require.ElementsMatch(t, inserted, rig.evictedKeys, "应淘汰所有过期项")
+		t.Logf("回调被触发的 key：%v", evictedKeys)
+		require.ElementsMatch(t, inserted, evictedKeys, "应淘汰所有过期项")
 	})
 
 }

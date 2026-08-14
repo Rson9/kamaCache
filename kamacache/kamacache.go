@@ -16,13 +16,14 @@ import (
 
 // Node 是 kamaCache 集群的节点。
 type Node struct {
-	mu     sync.RWMutex
-	opts   NodeOptions
-	server *server.Server
-	picker peer.PeerPicker
-	groups map[string]*Group // 使用公共的 Group 类型
-	logger *logrus.Entry
-	closer io.Closer // 用于统一关闭所有可关闭的组件
+	mu           sync.RWMutex
+	opts         NodeOptions
+	server       *server.Server
+	picker       peer.PeerPicker
+	groups       map[string]*Group // 使用公共的 Group 类型
+	logger       *logrus.Entry
+	closer       io.Closer // 用于统一关闭所有可关闭的组件
+	shutdownOnce sync.Once
 }
 
 // NewNode 初始化并返回一个新节点。
@@ -31,6 +32,9 @@ func NewNode(opts ...NodeOption) (*Node, error) {
 	options := defaultNodeOptions()
 	for _, opt := range opts {
 		opt(&options)
+	}
+	if options.Logger == nil {
+		options.Logger = logrus.StandardLogger()
 	}
 
 	// 参数校验
@@ -44,11 +48,12 @@ func NewNode(opts ...NodeOption) (*Node, error) {
 	logger := options.Logger.WithField("component", "node")
 	logger.Info("Initializing node...")
 
-	// 使用一个 closer 来管理所有需要关闭的资源，确保初始化失败时能优雅退出
+	// 使用一个 closer 来管理所有需要关闭的资源，确保初始化失败时能优雅退出。
 	closer := &resourceCloser{}
+	initialized := false
 	defer func() {
-		if err := recover(); err != nil || closer.err != nil {
-			closer.Close() // 如果发生 panic 或错误，则关闭所有已创建的资源
+		if !initialized {
+			_ = closer.Close()
 		}
 	}()
 
@@ -67,7 +72,12 @@ func NewNode(opts ...NodeOption) (*Node, error) {
 	closer.Add(picker)
 
 	// 创建 gRPC 服务
-	srv, err := server.NewServer(options.SelfAddr, options.ServiceName, server.WithEtcdEndpoints(options.EtcdEndpoints))
+	srv, err := server.NewServer(
+		options.SelfAddr,
+		options.ServiceName,
+		server.WithEtcdEndpoints(options.EtcdEndpoints),
+		server.WithEtcdLeaseTTL(options.EtcdLeaseTTL),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create server: %w", err)
 	}
@@ -81,6 +91,7 @@ func NewNode(opts ...NodeOption) (*Node, error) {
 		logger: logger,
 		closer: closer,
 	}
+	initialized = true
 
 	logger.Info("Node initialized successfully")
 	return node, nil
@@ -114,6 +125,7 @@ func (n *Node) NewGroup(name string, getter Getter, opts ...GroupOption) (*Group
 	// 3. 创建内部 Group 实例
 	internalG := group.NewGroup(name, getter, internalGroupOpts...)
 	if err := n.server.RegisterGroup(internalG); err != nil {
+		_ = internalG.Close()
 		return nil, fmt.Errorf("failed to register group with server: %w", err)
 	}
 
@@ -170,25 +182,41 @@ func (n *Node) Run() error {
 }
 
 func (n *Node) Shutdown() {
-	n.logger.Info("Shutting down node...")
-	if err := n.closer.Close(); err != nil {
-		n.logger.WithError(err).Error("Error during node shutdown")
-	}
-	n.logger.Info("Node shut down successfully.")
+	n.shutdownOnce.Do(func() {
+		n.logger.Info("Shutting down node...")
+
+		n.mu.Lock()
+		groups := make([]*Group, 0, len(n.groups))
+		for _, g := range n.groups {
+			groups = append(groups, g)
+		}
+		n.mu.Unlock()
+		for _, g := range groups {
+			_ = g.internalGroup.Close()
+		}
+
+		if err := n.closer.Close(); err != nil {
+			n.logger.WithError(err).Error("Error during node shutdown")
+		}
+		n.logger.Info("Node shut down successfully.")
+	})
 }
 
 // resourceCloser 是一个辅助工具，用于安全地关闭多个 io.Closer
 type resourceCloser struct {
 	closers []io.Closer
 	err     error
+	once    sync.Once
 }
 
 func (rc *resourceCloser) Add(c io.Closer) { rc.closers = append(rc.closers, c) }
 func (rc *resourceCloser) Close() error {
-	for i := len(rc.closers) - 1; i >= 0; i-- { // 以相反的顺序关闭
-		if err := rc.closers[i].Close(); err != nil {
-			rc.err = fmt.Errorf("failed to close resource: %w", err)
+	rc.once.Do(func() {
+		for i := len(rc.closers) - 1; i >= 0; i-- { // 以相反的顺序关闭
+			if err := rc.closers[i].Close(); err != nil && rc.err == nil {
+				rc.err = fmt.Errorf("failed to close resource: %w", err)
+			}
 		}
-	}
+	})
 	return rc.err
 }

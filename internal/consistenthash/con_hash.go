@@ -23,6 +23,8 @@ type Map struct {
 	nodeReplicas map[string]int
 	// 节点负载统计
 	nodeCounts map[string]*atomic.Int64
+	stopCh     chan struct{}
+	closeOnce  sync.Once
 	// 总请求数
 	totalRequests atomic.Int64
 }
@@ -34,6 +36,7 @@ func New(opts ...Option) *Map {
 		hashMap:      make(map[int]string),
 		nodeReplicas: make(map[string]int),
 		nodeCounts:   make(map[string]*atomic.Int64),
+		stopCh:       make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -42,6 +45,13 @@ func New(opts ...Option) *Map {
 
 	m.startBalancer() // 启动负载均衡器
 	return m
+}
+
+// Close stops the background balancer.
+func (m *Map) Close() {
+	m.closeOnce.Do(func() {
+		close(m.stopCh)
+	})
 }
 
 // Option 配置选项
@@ -159,6 +169,12 @@ func (m *Map) checkAndRebalance() {
 		return // 样本太少，不进行调整
 	}
 	m.mu.RLock()
+	nodeCount := len(m.nodeReplicas)
+	m.mu.RUnlock()
+	if nodeCount == 0 {
+		return
+	}
+	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	// 计算负载情况
@@ -183,6 +199,9 @@ func (m *Map) checkAndRebalance() {
 func (m *Map) rebalanceNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.nodeReplicas) == 0 {
+		return
+	}
 
 	avgLoad := float64(m.totalRequests.Load()) / float64(len(m.nodeReplicas))
 
@@ -252,8 +271,13 @@ func (m *Map) startBalancer() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			m.checkAndRebalance()
+		for {
+			select {
+			case <-ticker.C:
+				m.checkAndRebalance()
+			case <-m.stopCh:
+				return
+			}
 		}
 	}()
 }

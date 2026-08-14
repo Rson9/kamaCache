@@ -4,7 +4,6 @@ go 1.24.4
 
 require (
 	github.com/sirupsen/logrus v1.9.3
-	github.com/spaolacci/murmur3 v1.1.0
 	github.com/stretchr/testify v1.10.0
 	go.etcd.io/etcd/client/v3 v3.6.2
 	go.etcd.io/etcd/server/v3 v3.6.2

@@ -22,18 +22,28 @@ func (g *Group) Get(ctx context.Context, key string) (cache.ByteView, error) {
 		return cache.ByteView{}, ErrGroupClosed
 	}
 
-	// 1. 查本地缓存
-	if view, ok := g.mainCache.Get(key); ok {
-		atomic.AddInt64(&g.stats.localHits, 1)
-		return view, nil
+	// 1. 只有当前节点是负责人时才读取本地缓存。远程结果不在入口节点
+	// 缓存，避免 Set 后不同节点保留无法失效的旧副本。
+	if g.picker == nil {
+		if view, ok := g.mainCache.Get(key); ok {
+			atomic.AddInt64(&g.stats.localHits, 1)
+			return view, nil
+		}
+	} else if _, isSelf := g.picker.PickPeer(key); isSelf {
+		if view, ok := g.mainCache.Get(key); ok {
+			atomic.AddInt64(&g.stats.localHits, 1)
+			return view, nil
+		}
 	}
 	atomic.AddInt64(&g.stats.localMisses, 1)
-	g.logger.Infof("[Test] key=%s, picking peer...", key)
 	// 2. 本地未命中，调用统一的 load 方法
 	return g.load(ctx, key)
 }
 
-// Set 设置缓存并且同步到对等节点
+// Set 设置缓存并同步到负责该键的对等节点。
+//
+// Set 在返回前完成远程写入，避免调用方在返回成功后仍然不知道数据
+// 是否已经写入负责节点。缓存只保存在负责人节点，避免远程副本失效不一致。
 func (g *Group) Set(key string, value []byte) error {
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
@@ -42,30 +52,28 @@ func (g *Group) Set(key string, value []byte) error {
 		return ErrKeyRequired
 	}
 
-	// 1. 立刻更新本地缓存
-	g.SetLocally(key, cache.NewByteView(value))
-
-	// 2. 如果存在对等节点系统，决定如何同步
+	// 1. 如果存在对等节点系统，先决定负责节点。
 	if g.picker != nil {
-		// 使用后台 goroutine 异步同步，避免阻塞主流程
-		go func() {
-			if remote, isSelf := g.picker.PickPeer(key); !isSelf {
-				// 这个 key 应该由远端节点管理，我们通知它去 Set
-				syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
+		if remote, isSelf := g.picker.PickPeer(key); !isSelf {
+			// 这个 key 应该由远端节点管理，我们通知它去 Set。
+			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-				g.logger.Debugf("Forwarding SET for key '%s' to peer %s", key, remote.Addr())
-				if err := remote.Set(syncCtx, g.name, key, value); err != nil {
-					g.logger.WithError(err).Warnf("Failed to sync SET for key '%s' to peer %s", key, remote.Addr())
-				}
+			g.logger.Debugf("Forwarding SET for key '%s' to peer %s", key, remote.Addr())
+			if err := remote.Set(syncCtx, g.name, key, value); err != nil {
+				g.mainCache.Delete(key)
+				return err
 			}
-			// 如果 isSelf 为 true，说明数据本来就该归我管，无需远程同步。
-		}()
+			return nil
+		}
 	}
+
+	// 2. 没有远程节点或当前节点是负责人时，写入本地缓存。
+	g.SetLocally(key, cache.NewByteView(value))
 	return nil
 }
 
-// Delete 删除缓存并且同步到对等节点
+// Delete 删除缓存并同步到负责该键的对等节点。
 func (g *Group) Delete(key string) error {
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
@@ -74,22 +82,19 @@ func (g *Group) Delete(key string) error {
 		return ErrKeyRequired
 	}
 
-	// 1. 立刻删除本地缓存
+	// 1. 清理当前节点可能残留的副本。
 	g.mainCache.Delete(key)
 
-	// 2.委托对等节点系统处理删除同步
-	// 2. 决定如何同步删除
+	// 2. 决定如何同步删除。
 	if g.picker != nil {
-		go func() {
-			if remote, isSelf := g.picker.PickPeer(key); !isSelf {
-				syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				g.logger.Debugf("Forwarding DELETE for key '%s' to peer %s", key, remote.Addr())
-				if err := remote.Delete(syncCtx, g.name, key); err != nil {
-					g.logger.WithError(err).Warnf("Failed to sync DELETE for key '%s' to peer %s", key, remote.Addr())
-				}
+		if remote, isSelf := g.picker.PickPeer(key); !isSelf {
+			syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			g.logger.Debugf("Forwarding DELETE for key '%s' to peer %s", key, remote.Addr())
+			if err := remote.Delete(syncCtx, g.name, key); err != nil {
+				return err
 			}
-		}()
+		}
 	}
 	return nil
 }
@@ -109,6 +114,13 @@ func (g *Group) SetLocally(key string, value cache.ByteView) {
 // GetLocally 是为 gRPC 服务器设计的专用方法。
 // 它只从本节点的缓存或数据源(getter)加载数据，绝不涉及任何远程节点查找，以防止死锁。
 func (g *Group) GetLocally(ctx context.Context, key string) (cache.ByteView, error) {
+	if key == "" {
+		return cache.ByteView{}, ErrKeyRequired
+	}
+	if atomic.LoadInt32(&g.closed) == 1 {
+		return cache.ByteView{}, ErrGroupClosed
+	}
+
 	// 1. 检查本地缓存 (与你的 Get 函数开头逻辑一致)
 	if view, ok := g.mainCache.Get(key); ok {
 		atomic.AddInt64(&g.stats.localHits, 1)
@@ -153,9 +165,8 @@ func (g *Group) load(ctx context.Context, key string) (cache.ByteView, error) {
 				if err == nil {
 					// 远程获取成功
 					atomic.AddInt64(&g.stats.peerHits, 1)
-					bv := cache.NewByteView(bytes)
-					g.SetLocally(key, bv) // 填充本地缓存
-					return bv, nil
+					// 只在负责人节点缓存，避免远程副本无法失效而产生旧值。
+					return cache.NewByteView(bytes), nil
 				}
 
 				// 远程节点获取失败 (网络错误，节点宕机等)

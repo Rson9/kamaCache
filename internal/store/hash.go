@@ -2,8 +2,6 @@ package store
 
 import (
 	"encoding/binary"
-	"github.com/spaolacci/murmur3"
-	"unsafe"
 )
 
 type HashFunc func(key string) uint32
@@ -40,10 +38,7 @@ func hashFNV(key string) uint32 {
 }
 
 func hashMurmur3(key string) uint32 {
-	// --- 优化点 1: 零内存分配的 string -> []byte 转换 ---
-	// 使用 unsafe 包直接获取 string 底层 byte 数组的指针，避免了内存分配和数据复制。
-	// 这是性能攸关代码中的标准做法。
-	data := unsafe.Slice(unsafe.StringData(key), len(key))
+	data := []byte(key)
 
 	var hash uint32 = 0 // 使用种子(seed)初始化，这里为0
 	length := len(data)
@@ -94,11 +89,8 @@ func hashMurmur3(key string) uint32 {
 	return hash
 }
 
-// HashWithMurmur3Library 使用 spaolacci/murmur3 库来计算哈希值
-// 这是一个高性能、零分配（对于 string）的推荐实现
+// HashWithMurmur3Library 保留原有函数名，使用本地实现计算 Murmur3。
+// 这样可以避免第三方实现的 unsafe checkptr 问题。
 func HashWithMurmur3Library(key string) uint32 {
-	// spaolacci/murmur3 库内部已经处理了从 string 到 []byte 的零拷贝转换
-	// 你无需手动使用 unsafe 包，就能获得最佳性能。
-	// 第二个参数是种子(seed)，你可以保持为0，或选择一个固定的值。
-	return murmur3.Sum32WithSeed([]byte(key), 0)
+	return hashMurmur3(key)
 }
