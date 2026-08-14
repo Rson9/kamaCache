@@ -1,129 +1,69 @@
-# kamaCache: 分布式缓存架构与使用指南 🚀
+# kamaCache
 
-## 1.0 概述 🌟
+基于 Go 的分布式内存缓存库。kamaCache 使用 Etcd 做服务发现、gRPC 做节点间通信，并通过一致性哈希将缓存键路由到负责节点；业务代码只需要操作 `Group`，不需要直接处理节点选择和远程调用。
 
-**kamaCache** 是一个 “开箱即用” 的高性能、分布式 Go 内存缓存库。它将复杂的分布式逻辑（如节点发现、gRPC通信、一致性哈希）完全封装，为开发者提供了一个极其简洁的 API。你只需几行代码，就能将你的单机应用缓存无缝升级为强大的分布式缓存集群。
+> 当前版本：`v0.2.0`
+> 注意：`NewNode` 当前必须连接 Etcd，项目不是完全脱离外部依赖的本地缓存库。
 
-**核心特性:**
+## 特性
 
-*   **⚡ 极致易用**: API 高度封装，调用 `Get()` 即可，完全屏蔽底层分布式细节。
-*   **🌐 高效集群**: 节点间通过 **gRPC** 进行 P2P 通信，实现低延迟、高吞吐的数据交换。
-*   **⚖️ 智能路由**: 内置**一致性哈希**，自动将 Key 定位到最优节点，并在节点变化时最小化缓存迁移。
-*   **🛡️ 自动容错**: 去中心化架构，无单点故障。单个节点宕机，集群服务不中断，仅影响该节点数据。
-*   **🗑️ 智能淘汰**:
-    *   **LRU**: 内置默认的 LRU 策略，高效管理内存。
-    *   **2Q 算法**: 提供可选的 2Q 策略，能有效防止批量数据访问造成的“缓存污染”，提高复杂场景下的命中率。
-*   **🔧 灵活可配**: 支持**可插拔的哈希函数**（如 Murmur3, CRC32），允许用户根据业务场景进行性能微调。
+- **本地内存缓存**：支持 LRU；内部实现还包含 LRU2（2Q）存储。
+- **分布式路由**：通过一致性哈希选择负责节点，节点变化时尽量减少键迁移。
+- **服务发现**：节点使用 Etcd 注册和发现，使用相同 `ServiceName` 的节点组成同一缓存集群。
+- **gRPC 通信**：跨节点执行 `Get`、`Set`、`Delete`。
+- **回源加载**：缓存未命中时调用业务提供的 `Getter`，并将结果写入本地缓存。
+- **请求合并**：同一节点上对同一个键的并发加载由 singleflight 合并。
+- **多缓存组**：一个节点可以创建多个相互隔离的 `Group`。
+- **只读值视图**：`Get` 返回 `ByteView`，避免缓存数据被调用方直接修改。
 
-## 2.0 架构与调用流程 🏛️
+## 工作方式
 
-尽管实现细节被封装，但理解其高层工作原理有助于你更好地使用它。
-
-### 2.1 🏠 单实例模式
-
-当你的应用只启动一个节点时，kamaCache 会自动以单实例模式运行，所有操作都在本地内存完成，无任何网络开销。
-
-**调用流程图:**
 ```mermaid
-graph TD
-    subgraph "kamaCache 单实例部署"
-    A[💻 应用程序] -->|Get my_key| B{🧱 缓存组}
-        B -->|1️⃣ 缓存查询| C[📦 本地缓存]
-        C -->|✅ 命中| D[返回值]
-        C -->|❌ 未命中| E{2️⃣ 执行 Getter}
-        E -->|3️⃣ 写入缓存| C
-        E --> D
-    end
-
-    subgraph "外部数据源"
-        F[🗄️ 数据库/API]
-    end
-
-    E -->|访问数据源| F
-    F --> E
-
-    D -->|响应| A
-
+flowchart LR
+    A[业务代码] --> B[Group.Get]
+    B --> C{本地缓存命中?}
+    C -->|是| D[返回 ByteView]
+    C -->|否| E[一致性哈希选择节点]
+    E -->|当前节点负责| F[调用 Getter 回源]
+    E -->|远程节点负责| G[gRPC 请求远程节点]
+    G -->|远程未命中| H[远程节点调用 Getter]
+    F --> I[写入本地缓存]
+    H --> I
+    I --> D
 ```
 
-### 2.2 🌐 分布式集群模式
+`Set` 和 `Delete` 会先操作当前节点，然后在需要时异步转发到负责该键的远程节点。因此跨节点同步是异步的，调用返回不代表所有节点已经完成同步。
 
-当你启动多个配置了相同对等节点列表的实例时，它们会自动组成一个集群。**所有复杂的 gRPC 通信和节点查找都在库内部自动完成**。
+## 环境要求
 
-#### **Get(key) 读取流程**
+- Go `1.24.4` 或更高版本（以 `go.mod` 为准）。
+- Etcd 服务，默认使用 `localhost:2379`。
 
-对你的应用代码来说，调用方式与单实例模式**完全一样**，但其内部的调用流程却大不相同。
-
-1.  你的应用在**节点A**上调用 `group.Get("some_key")`。
-2.  kamaCache **优先检查节点A的本地缓存**。如果命中，立即返回。
-3.  如果本地未命中，kamaCache 会**自动查询内置的一致性哈希环**。
-4.  **情况一：哈希环指示 `some_key` 就应该存放在节点A**。库会自动调用你提供的 `Getter` 从数据库加载数据，存入节点A的本地缓存后返回。
-5.  **情况二：哈希环指示 `some_key` 存放在远程的节点B**。kamaCache 会**自动向节点B发起一个内部的 gRPC 请求**，获取数据后返回给你的应用。
-
-**调用流程图:**
-```mermaid
-graph TD
-    Client[💻 应用 @ 节点A] -- Get(key) --> GA{🗃️ Group @ 节点A}
-  
-     subgraph "kamaCache"
-        GA -- 优先查本地 --> CA[🗑️ LRU @ A]
-        CA -- ✅ 本地命中 --> Client
-        CA -- ❌ 本地未命中 --> Pick{内部查询<br>一致性哈希环}
-        Pick -- 负责人是自己 --> Load(内部调用 Getter<br>从 DB 加载)
-        Load -- 返回值 --> Client
-        Pick -- 负责人是节点B --> gRPCClient(内部发起<br>📞 gRPC 请求)
-    end
-
-    subgraph 节点B
-        gRPCServer[📡 内部 gRPC 服务 @ B]
-    end
-
-    gRPCClient --> gRPCServer
-    gRPCServer --> gRPCClient
-    gRPCClient -- 返回值 --> Client
-```
-
-#### **Set(key, value) 写入流程**
-
-与读取流程一样，`Set` 方法也会自动将数据写入正确的节点。
-
-1.  你的应用在**节点A**上调用 `group.Set("some_key", "value")`。
-2.  kamaCache **自动查询一致性哈希环**，定位到负责 `some_key` 的节点（可能是节点A自己，也可能是远程的节点B）。
-3.  库**自动将数据**通过内存写入或内部 gRPC 请求，**存放到正确的节点**上。
-
-> ✨ **核心价值**: 你的业务代码无需关心数据到底存在哪个节点，也无需手动编写任何网络通信代码。只需像操作一个本地 Map 一样操作 `Group` 对象即可。
-
-## 3.0 快速开始指南 🚀
-
-我们将实际操作，搭建一个支持多 Group、可动态创建、带 HTTP 接口的本地缓存服务。
-
-
-### ✅ 适用范围
-
-> 支持 **本地运行模式**，不依赖网络分布式环境，适合本地开发调试。
-> 支持 **分布式运行模式** ，节点间依赖ETCD进行管理，适合生产环境部署。
-
-### **第 1 步: 初始化项目并获取依赖** ✅
+启动本地 Etcd 的一种方式：
 
 ```bash
-# 创建项目目录
-mkdir my-cluster-app
-cd my-cluster-app
-
-# 初始化 Go Module
-go mod init my-cluster-app
-
-# 获取 kamaCache 库
-go get github.com/rson9/kamaCache 
+etcd \
+  --listen-client-urls http://127.0.0.1:2379 \
+  --advertise-client-urls http://127.0.0.1:2379
 ```
 
-### **第 2 步: 编写启动代码 (`main.go`)** ✍️
+也可以使用已有 Etcd 实例，但当前服务注册逻辑仍使用默认的 `localhost:2379` 地址；部署到非本机 Etcd 前，请先确认注册逻辑与网络配置一致。
 
-这是你唯一需要编写的文件。你只需要做三件事：
+## 安装
 
-1. 创建一个或多个缓存组 (`Group`)，并提供回源逻辑 (`Getter`)。
-2. 启动 HTTP 服务，支持通过 URL 操作缓存。
-3. 运行服务，享受本地高性能缓存。
+```bash
+go get github.com/rson9/kamaCache@v0.2.0
+```
+
+导入公共包：
+
+```go
+import "github.com/rson9/kamaCache/kamacache"
+```
+
+## 快速开始
+
+下面的示例启动一个节点，创建名为 `users` 的缓存组，并演示一次回源读取。运行前请先启动 Etcd。
 
 ```go
 package main
@@ -132,132 +72,183 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"sync"
-	"time"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/rson9/kamaCache/kamacache"
 )
 
 func main() {
-	const (
-		nodeCount = 3
-		groupName = "player-scores"
+	node, err := kamacache.NewNode(
+		// 必须是当前节点监听的地址；多机部署时必须能被其它节点访问。
+		kamacache.WithSelfAddr("127.0.0.1:8000"),
+		kamacache.WithEtcdEndpoints([]string{"http://127.0.0.1:2379"}),
+		kamacache.WithServiceName("demo-cache"),
 	)
-
-	// 这里简单演示如何启动多个节点
-	var nodes []*kamacache.Node
-	var wg sync.WaitGroup
-
-	for i := 0; i < nodeCount; i++ {
-		addr := fmt.Sprintf("localhost:%d", 8000+i)
-		node, err := kamacache.NewNode(
-			kamacache.WithSelfAddr(addr),
-			kamacache.WithEtcdEndpoints([]string{"http://localhost:2379"}),
-			kamacache.WithServiceName("kamacache-test"),
-		)
-		if err != nil {
-			log.Fatalf("创建节点失败: %v", err)
-		}
-
-		// 为每个节点创建并注册 Group
-		_, err = node.NewGroup(groupName, kamacache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
-			log.Printf("[%s] 加载 key=%s", addr, key)
-			return []byte(fmt.Sprintf("value_for_%s", key)), nil
-		}), kamacache.WithMaxBytes(2<<20))
-		if err != nil {
-			log.Fatalf("创建缓存组失败: %v", err)
-		}
-
-		nodes = append(nodes, node)
-
-		wg.Add(1)
-		go func(n *kamacache.Node) {
-			defer wg.Done()
-			if err := n.Run(); err != nil {
-				log.Printf("节点运行失败: %v", err)
-			}
-		}(node)
-	}
-
-	// 等待节点完成启动并通过 Etcd 发现彼此
-	time.Sleep(3 * time.Second)
-
-	// 这里可以对任一节点的 Group 进行操作
-	group := nodes[0].GetGroup(groupName)
-	if group == nil {
-		log.Fatal("缓存组未找到")
-	}
-
-	// 演示简单 Get 操作
-	val, err := group.Get(context.Background(), "testkey")
 	if err != nil {
-		log.Fatalf("Get 失败: %v", err)
+		log.Fatal(err)
 	}
-	log.Printf("获取 key=testkey 的值: %s", val.String())
 
-	// 关闭所有节点
-	for _, node := range nodes {
+	users, err := node.NewGroup(
+		"users",
+		kamacache.GetterFunc(func(ctx context.Context, key string) ([]byte, error) {
+			// 在这里查询数据库或其它后端数据源。
+			return []byte(fmt.Sprintf("value-for-%s", key)), nil
+		}),
+		kamacache.WithMaxBytes(64<<20), // 64 MiB
+	)
+	if err != nil {
 		node.Shutdown()
+		log.Fatal(err)
 	}
-	wg.Wait()
-}
 
+	// Node.Run 会阻塞，通常放到 goroutine 中运行。
+	runErr := make(chan error, 1)
+	go func() { runErr <- node.Run() }()
+
+	value, err := users.Get(context.Background(), "user:1")
+	if err != nil {
+		node.Shutdown()
+		log.Fatal(err)
+	}
+	log.Printf("user:1 = %s", value.String())
+
+	stop, stopCancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopCancel()
+	select {
+	case <-stop.Done():
+		node.Shutdown()
+	case err := <-runErr:
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+}
 ```
 
-
-### **第 3 步: 运行服务并验证** 💨
+保存为 `main.go` 后运行：
 
 ```bash
-go run main.go
+go run .
 ```
 
+### 多节点部署
 
-## 4.0 部署与最佳实践 💡
+在多个进程或多个实例中使用相同的 `ServiceName` 和 Etcd 集群地址，并为每个节点设置不同的 `SelfAddr`：
 
-*   **容器化**: 强烈建议使用 Docker 将应用打包，并通过 Kubernetes 或 Docker Compose 进行部署和管理。
-*   **服务发现**: 在生产环境中，应通过配置中心（如 Nacos, Etcd）或K8s的服务发现机制来动态管理 `peers` 列表，而不是硬编码。
-*   **网络**: 将所有缓存节点部署在同一个低延迟的内网环境（如 AWS VPC 或阿里云 VPC）中，以获得最佳性能。
-*   **监控**: 监控节点的 CPU、内存使用情况，以及缓存的命中率、Get/Set 次数等关键指标。
+| 节点 | `SelfAddr` | `ServiceName` |
+| --- | --- | --- |
+| A | `10.0.0.11:8000` | `production-cache` |
+| B | `10.0.0.12:8000` | `production-cache` |
+| C | `10.0.0.13:8000` | `production-cache` |
 
-## 5.0 当前功能概览与路线图📘 
+每个节点都需要注册同名的 `Group`。`SelfAddr` 同时用于 gRPC 监听和服务注册；不要在跨主机部署时使用 `localhost` 或 `127.0.0.1`。
 
-### ✅ 已实现功能
+## API 速览
 
-| 模块                          | 描述                                           |
-| --------------------------- | -------------------------------------------- |
-| 🧠 **本地缓存 (Local Cache)**   | 提供纯内存高性能缓存，支持 LRU 与 LRU2 替换策略，灵活设置容量         |
-| 🔁 **多种 LRU 算法实现**          | 支持标准 LRU、TwoQueue (LRU2)、Clock-LRU 等实现，可自由扩展 |
-| 🧰 **多缓存组支持 (Multi-Group)** | 支持一个服务中创建多个缓存 Group，缓存空间隔离，支持动态注册、运行时创建      |
-| 🪢 **分布式节点通信**              | 使用 gRPC 实现高性能对等节点通信，支持远程拉取 / 回源 / 路由         |
-| 🌐 **一致性哈希算法**              | 内置一致性哈希（支持多个 hash 函数），实现分布式数据负载均衡，支持虚拟节点数配置  |
-| 📡 **服务发现与注册 (Etcd)**       | 可选集成 Etcd，自动注册服务并发现其它节点，支持用户名/密码、连接超时等配置     |
-| 📈 **缓存统计信息**               | 每个 Group 支持缓存命中率、淘汰次数、回源次数、远程请求等详细指标输出       |
-| 🧩 **服务封装简化 (Builder API)** | 提供统一启动函数（如 `StartServerWithGroups`），自动完成 Group 注册、Peer Picker 配置等逻辑 |
+### 创建节点
 
+```go
+node, err := kamacache.NewNode(
+	kamacache.WithSelfAddr("10.0.0.11:8000"),
+	kamacache.WithEtcdEndpoints([]string{"http://10.0.0.10:2379"}),
+	kamacache.WithServiceName("production-cache"),
+)
+```
 
-### 🚧 规划中功能（开发中 / 排期中）
+常用节点选项：
 
-| 模块                          | 描述                                                                  |
-| --------------------------- | ------------------------------------------------------------------- |
-| 🎛️ **配置友好化 (YAML/TOML)**   | 提供 YAML / JSON / TOML 配置文件加载，降低部署门槛，支持配置缓存策略、组定义、etcd 参数等           |
-| 🧭 **动态策略热更新**              | 支持运行时修改 Group 策略（如 LRU -> LRU2），缓存策略更灵活                             |
-| ☁️ **容器化部署与 K8s 支持**        | 提供官方 Dockerfile 与 Helm Chart，快速部署至生产环境                              |
-| 🔐 **权限控制与认证机制**            | 支持 HTTP/gRPC 认证鉴权，保障分布式通信安全                                         |
-| 🧪 **插件式扩展点**               | 用户可注入自定义淘汰策略、Hash 算法、压缩、序列化器等，提升系统可扩展性                              |
-| 🛠️ **控制面 CLI / Dashboard** | 提供命令行和 Web UI 用于实时查看节点状态、缓存状态、配置管理等                                 |
-| 📦 **多级缓存结构**               | 支持本地 L1 缓存 + 远程 L2 分布式缓存 + 回源 L3（数据库）的完整链路                          |
+| 选项 | 作用 |
+| --- | --- |
+| `WithSelfAddr` | 设置当前节点监听和注册的地址，必填。 |
+| `WithEtcdEndpoints` | 设置服务发现使用的 Etcd 地址，必填。 |
+| `WithServiceName` | 设置集群名称；名称相同的节点会互相发现。默认值为 `kamacache`。 |
+| `WithLogger` | 设置 Logrus 日志实例。 |
+| `WithEtcdLeaseTTL` | 设置节点租约时长的公共配置入口；当前注册实现仍使用固定的 10 秒租约。 |
 
+### 创建缓存组
 
-### 📣 我们欢迎反馈！
+```go
+group, err := node.NewGroup(
+	"users",
+	getter,
+	kamacache.WithMaxBytes(64<<20),
+	kamacache.WithCacheType(kamacache.LRU),
+)
+```
 
-如果你：
+`WithMaxBytes` 对 LRU 缓存尤其重要；建议显式设置为正数。当前公共 API 支持的组配置包括：
 
-* 遇到问题 ❗
-* 有想法 💡
-* 想一起参与开发 🛠️
+- `WithMaxBytes(bytes)`：设置 LRU 最大容量（字节）。
+- `WithCacheType(kamacache.LRU)`：使用 LRU 策略。
+- `WithCacheType(kamacache.LRU2)`：选择内部 LRU2 实现；其更细粒度的桶容量配置尚未通过公共 API 暴露。
+- `WithOnEvicted(fn)`：设置淘汰回调；该回调的参数类型目前引用了 `internal/store`，外部 module 使用时存在 API 暴露限制。
 
-欢迎创建 Issue、PR 或邮件联系我们！
+### 读取、写入和删除
 
-📍 GitHub: [https://github.com/rson9/kamaCache](https://github.com/rson9/kamaCache)
+```go
+ctx := context.Background()
 
-📧 Email: *[1302018451@qq.com](mailto:1302018451@qq.com)*
+value, err := group.Get(ctx, "user:1")
+if err != nil {
+	// Getter 或远程节点返回的错误会传到这里。
+	return err
+}
+
+fmt.Println(value.String())       // 字符串值
+bytes := value.ByteSlice()        // 返回数据副本
+_ = value.Len()                   // 数据长度
+
+if err := group.Set("user:1", []byte("updated")); err != nil {
+	return err
+}
+if err := group.Delete("user:1"); err != nil {
+	return err
+}
+```
+
+注意：
+
+- `key` 不能为空，否则 `Get`、`Set`、`Delete` 会返回错误。
+- `Get` 返回的是 `ByteView`，需要修改数据时请使用 `ByteSlice` 获取副本。
+- 当前公共 `Group` API 没有暴露 TTL/过期时间配置。
+- `Shutdown` 应在节点退出时调用，以关闭 gRPC、Etcd 客户端和对等节点连接。
+
+## 项目结构
+
+```text
+kamacache/                 公共 API：Node、Group、Getter、配置选项
+internal/cache/             ByteView 与缓存封装
+internal/store/             LRU、LRU2 及底层存储实现
+internal/group/             缓存组、回源与请求协调
+internal/peer/              一致性哈希、远程 Peer 与节点发现
+internal/server/            gRPC 服务端
+internal/proto/kama/v1/     Protobuf 定义
+example/                    多节点集成测试示例
+```
+
+## 开发与测试
+
+运行本地缓存实现的测试：
+
+```bash
+go test ./internal/...
+```
+
+多节点集成测试依赖本地 Etcd：
+
+```bash
+go test ./example
+```
+
+## 当前边界
+
+- `NewNode` 当前要求提供 Etcd 地址，尚未提供不依赖服务发现的纯本地 `Node` 模式。
+- 节点间的 `Set`/`Delete` 转发是异步的，不能将其当作跨节点强一致写入。
+- 当前仓库没有 YAML/TOML 配置加载、Docker/Helm 部署、Dashboard、鉴权等已实现的公共能力；这些内容不应视为当前版本特性。
+- 服务注册、租约时长和部分高级缓存参数仍有实现层配置未完全贯通的问题。
+
+## 许可证
+
+[MIT License](LICENSE)
